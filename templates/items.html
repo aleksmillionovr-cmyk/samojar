@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% from "macros.html" import phone, csrf %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ '💎' if kind == 'sub' else '🛍' }} {{ title }}<span class="sp"></span><a class="btn" href="/items/{{ kind }}/new">＋ Добавить</a></h1>
+<div class="split">
+  <div class="stack">
+  {% for it in lst %}
+    <div class="card item {{ '' if it.get('active', True) else 'off' }}">
+      <div class="em">{{ it.emoji }}</div>
+      <div class="info">
+        <div class="nm">{{ it.name }} {% if kind == 'sub' %}• {{ it.period }}{% else %}— {{ it.amount }}{% endif %}</div>
+        <div class="sub">
+          <b style="color:var(--text)">{{ it.price|money }}</b>
+          {% if kind == 'sub' and it.discount %}<span>· скидка {{ it.discount }}%{% if it.days %} на {{ it.days }} дн.{% endif %}</span>{% endif %}
+          {% if it.get('active', True) %}<span class="badge ok">в боте</span>{% else %}<span class="badge warn">скрыто</span>{% endif %}
+          {% if bk[it.key].text %}<span class="badge {{ bk[it.key].tone }}">{{ bk[it.key].text }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="acts">
+        <a class="btn sm" href="/items/{{ kind }}/{{ it.key }}">✏️ Изменить</a>
+        <form method="post" action="/items/{{ kind }}/{{ it.key }}/up" class="inline">{{ csrf() }}<button class="btn sec sm" title="Выше" {{ 'disabled' if loop.first }}>↑</button></form>
+        <form method="post" action="/items/{{ kind }}/{{ it.key }}/down" class="inline">{{ csrf() }}<button class="btn sec sm" title="Ниже" {{ 'disabled' if loop.last }}>↓</button></form>
+        <form method="post" action="/items/{{ kind }}/{{ it.key }}/toggle" class="inline">{{ csrf() }}<button class="btn sec sm">{{ '🙈 Скрыть' if it.get('active', True) else '👁 Показать' }}</button></form>
+        <form method="post" action="/items/{{ kind }}/{{ it.key }}/copy" class="inline">{{ csrf() }}<button class="btn sec sm" title="Сделать копию">📄</button></form>
+        <form method="post" action="/items/{{ kind }}/{{ it.key }}/delete" class="inline" data-confirm="Удалить «{{ it.name }}»? Это нельзя отменить (можно просто скрыть).">{{ csrf() }}<button class="btn bad sm" title="Удалить">🗑</button></form>
+      </div>
+    </div>
+  {% else %}<div class="card empty">Пока пусто, нажми «Добавить»</div>{% endfor %}
+  </div>
+  <div class="sticky">{{ phone('pv', screen, buttons, 'Список в боте') }}
+    <div class="hint">Скрытые позиции в боте не показываются. Порядок меняется стрелками ↑ ↓. Изменения видны в боте сразу.</div></div>
+</div>
+{% endblock %}

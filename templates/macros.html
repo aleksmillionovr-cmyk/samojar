@@ -1,0 +1,32 @@
+{% macro phone(id, html='', buttons=[], head='Так увидит покупатель') %}
+<div class="phone"><div class="phone-head"><span>📱 {{ head }}</span><span>бот</span></div>
+<div class="chat"><div class="bubble" id="{{ id }}">{{ html|tg }}</div>
+<div class="btns" id="{{ id }}-btns">{% for r in buttons %}<div class="r">{% for b in r %}<span>{{ b }}</span>{% endfor %}</div>{% endfor %}</div>
+</div></div>
+{% endmacro %}
+{% macro toolbar(id) %}
+<div class="fmt">
+<button type="button" data-for="{{ id }}" data-wrap="<b>|</b>" title="Жирный"><b>Ж</b></button>
+<button type="button" data-for="{{ id }}" data-wrap="<i>|</i>" title="Курсив"><i>К</i></button>
+<button type="button" data-for="{{ id }}" data-wrap="<u>|</u>" title="Подчёркнутый"><u>Ч</u></button>
+<button type="button" data-for="{{ id }}" data-wrap="<s>|</s>" title="Зачёркнутый"><s>З</s></button>
+<button type="button" data-for="{{ id }}" data-wrap="<code>|</code>" title="Моноширинный, копируется по нажатию">код</button>
+<button type="button" data-for="{{ id }}" data-wrap="<tg-spoiler>|</tg-spoiler>" title="Скрытый текст">спойлер</button>
+<button type="button" data-for="{{ id }}" data-wrap="<blockquote>|</blockquote>" title="Цитата">цитата</button>
+<button type="button" data-for="{{ id }}" data-wrap="<a |</a>" title="Ссылка">🔗</button>
+</div>
+{% endmacro %}
+{% macro csrf() %}<input type="hidden" name="csrf" value="{{ csrf_token() }}">{% endmacro %}
+{% macro status_badge(s) %}<span class="badge {{ 'ok' if s == 'done' else 'warn' if s in ('paid','waiting') else 'acc' if s == 'created' else 'bad' }}">{{ STATUS[s] or s }}</span>{% endmacro %}
+{% macro pager(page, pages) %}
+{% if pages > 1 %}<div class="pager">
+{% set args = request.args.to_dict() %}
+{% if page > 1 %}{% set _ = args.update(page=page-1) %}<a href="?{{ args|urlencode }}">← Назад</a>{% endif %}
+<span class="on">{{ page }} / {{ pages }}</span>
+{% if page < pages %}{% set _ = args.update(page=page+1) %}<a href="?{{ args|urlencode }}">Дальше →</a>{% endif %}
+</div>{% endif %}
+{% endmacro %}
+{% macro secret_input(name, value, placeholder='') %}
+<div class="secret"><input type="password" id="f_{{ name }}" name="{{ name }}" value="" autocomplete="off" placeholder="{{ ('сохранён: ' ~ (value|mask) ~ ' — оставь пустым, чтобы не менять') if value else placeholder }}"><button class="ghost" type="button" data-reveal="f_{{ name }}" title="Показать">👁</button></div>
+{% if value %}<label class="check" style="margin-top:6px;font-size:13px"><input type="checkbox" name="clear_{{ name }}"> удалить сохранённое значение</label>{% endif %}
+{% endmacro %}

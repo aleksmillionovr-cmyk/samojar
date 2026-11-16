@@ -1,0 +1,31 @@
+{% extends "base.html" %}{% from "macros.html" import status_badge, pager, csrf %}
+{% block title %}Заказы{% endblock %}
+{% block content %}
+<h1>🧾 Заказы<span class="sp"></span><a class="btn sec sm" href="/orders.csv?{{ request.query_string.decode() }}">⬇️ Скачать CSV</a></h1>
+<div class="tabs">{% for k, v in filters.items() %}<a href="?f={{ k }}{% if q %}&q={{ q|urlencode }}{% endif %}" class="{{ 'on' if f == k }}">{{ v[0] }}<span class="n">{{ counts[k] }}</span></a>{% endfor %}</div>
+<form class="toolbar-row" method="get"><input type="hidden" name="f" value="{{ f }}">
+  <input type="search" name="q" value="{{ q }}" placeholder="№ заказа, ник Roblox, Telegram, позиция">
+  <select name="m"><option value="">Любой способ оплаты</option>{% for k, v in METHODS.items() %}<option value="{{ k }}" {{ 'selected' if m == k }}>{{ v }}</option>{% endfor %}</select>
+  <button class="btn sec">Найти</button>{% if q or m %}<a class="ghost" href="?f={{ f }}">сбросить</a>{% endif %}
+  <span class="muted small" style="margin-left:auto">найдено: {{ total }}</span>
+</form>
+{% if rows %}
+<div class="table-wrap"><table>
+  <thead><tr><th>№</th><th>Позиция</th><th>Покупатель</th><th>Ник</th><th>Сумма</th><th>Статус</th><th>Дата</th><th></th></tr></thead>
+  <tbody>
+  {% for o in rows %}
+  <tr class="link order-row" data-href="/orders/{{ o.id }}">
+    <td>#{{ o.id }}</td>
+    <td>{{ o.title }}</td>
+    <td><a href="/users/{{ o.user_id }}">{{ o.username or o.user_id }}</a></td>
+    <td>{% if o.nick %}<span class="nick">{{ o.nick }}</span>{% elif o.status == 'paid' %}<span class="badge warn">ждём</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+    <td class="nowrap">{{ order_paid(o) }}</td>
+    <td>{{ status_badge(o.status) }}</td>
+    <td class="nowrap muted">{{ (o.paid_at or o.created_at)|dt }}</td>
+    <td class="right">{% if o.status in ('paid','waiting') %}<form method="post" action="/orders/{{ o.id }}/done" class="inline">{{ csrf() }}<input type="hidden" name="back" value="{{ request.full_path }}"><button class="btn ok xs">✅ Выдано</button></form>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
+{{ pager(page, pages) }}
+{% else %}<div class="card empty">Здесь пусто</div>{% endif %}
+{% endblock %}

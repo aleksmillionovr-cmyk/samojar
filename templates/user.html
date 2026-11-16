@@ -1,0 +1,61 @@
+{% extends "base.html" %}{% from "macros.html" import status_badge, csrf, toolbar, phone %}
+{% block title %}Пользователь {{ uid }}{% endblock %}
+{% block content %}
+{% set name = (((user.first_name or '') ~ ' ' ~ (user.last_name or '')).strip() if user else '') or ('@' ~ user.username if user and user.username else uid) %}
+<h1><a href="/users" class="muted">← Покупатели</a> / {{ name }}
+  {% if user and user.banned %}<span class="badge bad">заблокирован</span>{% endif %}
+  {% if is_admin %}<span class="badge acc">админ</span>{% endif %}
+</h1>
+<div class="split wide">
+  <div class="stack">
+    <div class="card">
+      <dl class="kv">
+        <dt>Telegram ID</dt><dd><code>{{ uid }}</code> · <a href="tg://user?id={{ uid }}">открыть в Telegram</a></dd>
+        {% if user and user.username %}<dt>Username</dt><dd><a href="https://t.me/{{ user.username }}" target="_blank" rel="noopener">@{{ user.username }}</a></dd>{% endif %}
+        <dt>Покупки</dt><dd><b>{{ spent|money }}</b> · {{ rows|selectattr('status', 'in', ['paid','waiting','done'])|list|length }} оплаченных заказов</dd>
+        <dt>Скидка подписчика</dt><dd>{{ discount ~ '%' if discount else 'нет' }}</dd>
+        {% if user %}
+        <dt>Впервые</dt><dd>{{ user.created_at|dt('%d.%m.%Y %H:%M') }}</dd>
+        <dt>Последняя активность</dt><dd>{{ user.last_seen|ago }}</dd>
+        <dt>Бот</dt><dd>{{ 'остановил бота (сообщения не доходят)' if user.bot_blocked else 'активен' }}</dd>
+        {% endif %}
+      </dl>
+    </div>
+    <h2>🧾 Заказы</h2>
+    {% if rows %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>№</th><th>Позиция</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr></thead>
+      <tbody>{% for o in rows %}<tr class="link" data-href="/orders/{{ o.id }}"><td><b>#{{ o.id }}</b></td><td>{{ o.title }}</td><td class="nowrap">{{ order_paid(o) }}</td><td>{{ status_badge(o.status) }}</td><td class="muted nowrap">{{ (o.paid_at or o.created_at)|dt }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+    {% else %}<div class="card empty">Заказов нет</div>{% endif %}
+  </div>
+  <div class="stack">
+    <div class="card">
+      <h2>✉️ Написать от имени бота</h2>
+      <form method="post" action="/users/{{ uid }}/message">{{ csrf() }}
+        {{ toolbar('msg') }}<textarea id="msg" name="text" style="min-height:110px" placeholder="Текст сообщения (можно с разметкой)"></textarea>
+        <div class="errs" id="pv_msg-errs"></div>
+        <div class="actions" style="margin-top:10px"><button class="btn">Отправить</button></div>
+      </form>
+      <div style="margin-top:12px">{{ phone('pv_msg', '', [], 'Предпросмотр') }}</div>
+    </div>
+    <div class="card">
+      <h2>📝 Заметка о покупателе</h2>
+      <form method="post" action="/users/{{ uid }}/note">{{ csrf() }}
+        <textarea name="note" style="min-height:80px" placeholder="Видна только в админке">{{ user.note if user and user.note else '' }}</textarea>
+        <div class="actions" style="margin-top:10px"><button class="btn sec sm">Сохранить</button></div>
+      </form>
+    </div>
+    {% if not is_admin %}
+    <div class="card">
+      <h2>⛔ Доступ к боту</h2>
+      <p class="muted small" style="margin-top:0">Заблокированный пользователь видит только сообщение «Доступ ограничен» (его текст — в разделе «Тексты»).</p>
+      <form method="post" action="/users/{{ uid }}/ban" data-confirm="{{ 'Разблокировать' if user and user.banned else 'Заблокировать' }} пользователя?">{{ csrf() }}
+        <button class="btn {{ 'ok' if user and user.banned else 'bad' }}">{{ '✅ Разблокировать' if user and user.banned else '⛔ Заблокировать' }}</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script>livePreview(document.getElementById('msg'),'/preview/message','pv_msg')</script>{% endblock %}

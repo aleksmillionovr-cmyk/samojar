@@ -1,0 +1,98 @@
+{% extends "base.html" %}{% from "macros.html" import csrf, secret_input %}
+{% block title %}Подключения{% endblock %}
+{% block content %}
+<h1>🔌 Подключения</h1>
+<p class="muted" style="margin-top:-8px">Токены и ключи хранятся на сервере в <code>data/config.json</code> (доступ только у бота) и здесь не показываются целиком. Поле секрета оставь пустым, чтобы не менять его.</p>
+<div class="anchor-nav"><a href="#telegram">🤖 Telegram</a><a href="#boomkassa">💳 BoomKassa</a><a href="#tgpay">💳 Платёжка Telegram</a><a href="#crypto">💵 CryptoBot</a><a href="#server">🌐 Сервер</a></div>
+{% if errors %}<div class="errbox"><b>Не сохранено:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
+
+<form method="post" id="intForm" data-dirty>{{ csrf() }}
+<div class="stack">
+  <div class="card section-title" id="telegram">
+    <h2>🤖 Telegram-бот <span class="badge {{ bot.tone }}">{{ bot.text }}{% if bot.username %} · @{{ bot.username }}{% endif %}</span></h2>
+    <div class="split even" style="gap:18px">
+      <div>
+        <label>Токен бота</label>
+        {{ secret_input('bot_token', c.bot_token, '123456789:AAH… из @BotFather') }}
+        <div class="hint">@BotFather → /mybots → бот → API Token. После смены токена бот перезапустится сам.</div>
+      </div>
+      <div>
+        <label>Telegram ID админов (через запятую)</label>
+        <input type="text" name="admin_ids" value="{{ c.admin_ids }}" placeholder="123456789">
+        <div class="hint">Сюда приходят новые заказы с кнопкой «✅ Выдано». Свой ID: @userinfobot. Админ должен один раз нажать /start в боте.</div>
+      </div>
+    </div>
+    <label>Закрытый канал для подписчиков (необязательно)</label>
+    <input type="text" name="private_channel_id" value="{{ c.private_channel_id }}" placeholder="-100… — бот должен быть админом канала" style="max-width:420px">
+    <div class="actions">
+      <button class="btn sec sm" form="t_telegram">Проверить токен</button>
+      <button class="btn sec sm" form="t_admins">Отправить тест админам</button>
+    </div>
+  </div>
+
+  <div class="card section-title" id="boomkassa">
+    <h2>💳 BoomKassa — карта и СБП</h2>
+    <div class="split even" style="gap:18px">
+      <div>
+        <label>API-ключ (bk_live_…)</label>
+        {{ secret_input('bk_api_key', c.bk_api_key, 'bk_live_…') }}
+        <div class="hint">Личный кабинет BoomKassa → «API и интеграция» → «Выпустить ключ».</div>
+        <label>Секрет вебхука</label>
+        {{ secret_input('bk_webhook_secret', c.bk_webhook_secret, 'выдаёт поддержка BoomKassa') }}
+        <div class="hint">Без него бот не узнает об оплате автоматически, и заказы придётся отмечать оплаченными вручную.</div>
+        <label>Адрес API</label>
+        <input type="text" name="bk_base_url" value="{{ c.bk_base_url }}">
+      </div>
+      <div>
+        <label>Адрес вебхука — отправь его в поддержку BoomKassa</label>
+        {% if webhook_url %}<div class="copy"><code>{{ webhook_url }}</code><button class="btn sec xs" type="button" data-copy="{{ webhook_url }}">Копировать</button></div>
+        {% if not webhook_url.startswith('https://') %}<div class="note warn" style="margin-top:8px">BoomKassa принимает только https-адрес. Установщик настраивает https сам; проверь «Адрес админки» ниже.</div>{% endif %}
+        {% else %}<div class="note warn">Укажи «Адрес админки» внизу страницы — из него получится адрес вебхука.</div>{% endif %}
+
+        <label style="margin-top:16px">Тарифы проекта</label>
+        {% if not c.bk_api_key %}<div class="muted small">Появятся после ввода API-ключа.</div>
+        {% else %}
+          {% if bk_error %}<div class="note bad small">{{ bk_error }}</div>{% endif %}
+          {% if bk_info and bk_info.tariffs %}
+          <table class="mini">{% for t in bk_info.tariffs %}<tr><td><code>{{ t.code }}</code></td><td>{{ t.title }}</td><td>{{ t.amount|money }}</td></tr>{% endfor %}</table>
+          <div class="hint">Обновлено {{ bk_info.fetched_at|ago }}. Тариф выбирается автоматически по цене позиции, или вручную в её карточке.</div>
+          {% elif bk_info %}<div class="note warn small">Тарифов пока нет. Их заводит поддержка BoomKassa — попроси тарифы на суммы твоих позиций.</div>{% endif %}
+        {% endif %}
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn sec sm" form="t_boomkassa">Проверить ключ и обновить тарифы</button>
+      <button class="btn sec sm" form="t_webhook">Проверить вебхук</button>
+    </div>
+  </div>
+
+  <div class="card section-title" id="tgpay">
+    <h2>💳 Карта через платёжку Telegram</h2>
+    <div class="row">
+      <div style="grid-column:span 2"><label>Provider token</label>{{ secret_input('provider_token', c.provider_token, 'из @BotFather → Payments') }}</div>
+      <div><label>Валюта счёта</label><input type="text" name="currency" value="{{ c.currency }}" maxlength="3"></div>
+    </div>
+    <div class="hint">@BotFather → /mybots → бот → Bot Settings → Payments. Для теста — провайдер с пометкой TEST.</div>
+  </div>
+
+  <div class="card section-title" id="crypto">
+    <h2>💵 CryptoBot (USDT)</h2>
+    <div class="row">
+      <div style="grid-column:span 2"><label>Токен Crypto Pay</label>{{ secret_input('crypto_pay_token', c.crypto_pay_token, '@CryptoBot → Crypto Pay → Create App') }}</div>
+      <div><label>Монета</label><input type="text" name="crypto_asset" value="{{ c.crypto_asset }}" maxlength="10"></div>
+    </div>
+    <label class="check"><input type="checkbox" name="crypto_testnet" {{ 'checked' if c.crypto_testnet in ('1','true','yes','on') }}><span>Тестовая сеть (@CryptoTestnetBot) <small>Сними галочку для приёма настоящих денег через @CryptoBot</small></span></label>
+    <div class="actions"><button class="btn sec sm" form="t_crypto">Проверить</button></div>
+  </div>
+
+  <div class="card section-title" id="server">
+    <h2>🌐 Сервер</h2>
+    <label>Адрес админки (https://…)</label>
+    <input type="text" name="public_url" value="{{ c.public_url }}" placeholder="https://45-158-185-31.sslip.io" style="max-width:520px">
+    <div class="hint">Нужен для адреса вебхука BoomKassa и команды /admin в боте. Установщик заполняет его сам.</div>
+  </div>
+</div>
+<div class="savebar"><button class="btn">💾 Сохранить подключения</button><span class="hint">Ключи платёжек начинают работать сразу. При смене токена бот перезапустится.</span></div>
+</form>
+{% for t in ['telegram', 'admins', 'boomkassa', 'webhook', 'crypto'] %}<form method="post" action="/integrations/test/{{ t }}" id="t_{{ t }}">{{ csrf() }}</form>{% endfor %}
+{% endblock %}

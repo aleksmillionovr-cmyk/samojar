@@ -1,0 +1,68 @@
+{% extends "base.html" %}{% from "macros.html" import csrf %}
+{% block title %}Настройки{% endblock %}
+{% block content %}
+<h1>⚙️ Настройки магазина</h1>
+{% if errors %}<div class="errbox"><b>Не сохранено:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
+<form method="post" data-dirty>{{ csrf() }}
+<div class="split even">
+  <div class="stack">
+    <div class="card section-title" id="shop">
+      <h2>🏪 Магазин</h2>
+      <div class="row">
+        <div style="grid-column:span 2"><label>Название магазина</label><input type="text" name="shop_name" value="{{ st.shop_name }}" maxlength="40"></div>
+        <div><label>Знак валюты</label><input type="text" name="currency_sign" value="{{ st.currency_sign }}" maxlength="4"></div>
+      </div>
+      <label>Аккаунт техподдержки (без @)</label>
+      <input type="text" name="support_username" value="{{ st.support_username }}" placeholder="my_support">
+      <div class="hint">Его покажет бот в разделе «Поддержка» и подставит вместо {support} в текстах.</div>
+      <label>Стикер на /start (file_id)</label>
+      <input type="text" name="welcome_sticker" value="{{ st.welcome_sticker }}" placeholder="пусто: анимированный 👋">
+      <div class="hint">Чтобы узнать file_id, отправь боту стикер со своего админ-аккаунта, он пришлёт ID.</div>
+    </div>
+
+    <div class="card section-title" id="buttons">
+      <h2>🔘 Кнопки нижнего меню</h2>
+      <div class="row">
+      {% for key, label in buttons %}<div><label>{{ label }}</label><input type="text" name="{{ key }}" value="{{ st[key] }}" maxlength="30"></div>{% endfor %}
+      </div>
+      <div class="hint">У тех, кто уже открывал бота, кнопки обновятся после /start. Старые подписи тоже продолжат работать.</div>
+    </div>
+
+    <div class="card section-title" id="mode">
+      <h2>🛠 Режим работы</h2>
+      <label class="check"><input type="checkbox" name="maintenance" {{ 'checked' if st.maintenance }}><span>Технический перерыв<small>Покупатели видят заглушку (текст в «Текстах»), админы пользуются ботом как обычно</small></span></label>
+      <label class="check"><input type="checkbox" name="notify_new_users" {{ 'checked' if st.notify_new_users }}><span>Сообщать админам о каждом новом пользователе</span></label>
+      <label>Через сколько часов отменять неоплаченный заказ</label>
+      <input type="number" name="order_ttl_hours" value="{{ st.order_ttl_hours }}" min="1" max="720" style="max-width:160px">
+      <div class="hint">Если оплата всё-таки придёт позже, заказ автоматически станет оплаченным.</div>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card section-title" id="payments">
+      <h2>💳 Способы оплаты</h2>
+      <p class="muted small" style="margin-top:0">Галочка включает способ в боте. Ключи и токены — в разделе <a href="/integrations">«Подключения»</a>. Способ без ключа бот не покажет.</p>
+
+      <label class="check"><input type="checkbox" name="enable_stars" {{ 'checked' if st.enable_stars }}><span>⭐ Telegram Stars <span class="badge ok">работает без настроек</span></span></label>
+      <label style="margin-top:10px">Курс: сколько рублей стоит 1 ⭐</label>
+      <input type="text" name="rub_per_star" value="{{ st.rub_per_star }}" inputmode="decimal" style="max-width:160px">
+      <div class="hint">Цена в звёздах = цена в рублях ÷ курс, с округлением вверх.</div>
+
+      <hr class="hr">
+      <label class="check"><input type="checkbox" name="enable_boomkassa" {{ 'checked' if st.enable_boomkassa }}><span>💳 Карта / СБП через BoomKassa {% if conn.boomkassa %}<span class="badge ok">ключ задан</span>{% else %}<a class="badge warn" href="/integrations#boomkassa">нужен API-ключ</a>{% endif %}</span></label>
+      <label style="margin-top:10px">Подпись кнопки</label>
+      <input type="text" name="bk_label" value="{{ st.bk_label }}" maxlength="30">
+
+      <hr class="hr">
+      <label class="check"><input type="checkbox" name="enable_card" {{ 'checked' if st.enable_card }}><span>💳 Карта через платёжку Telegram {% if conn.card %}<span class="badge ok">токен задан</span>{% else %}<a class="badge warn" href="/integrations#tgpay">нужен токен</a>{% endif %}</span></label>
+      <label style="margin-top:10px">Подпись кнопки</label>
+      <input type="text" name="card_label" value="{{ st.card_label }}" maxlength="30">
+
+      <hr class="hr">
+      <label class="check"><input type="checkbox" name="enable_crypto" {{ 'checked' if st.enable_crypto }}><span>💵 USDT через @CryptoBot {% if conn.crypto %}<span class="badge ok">токен задан</span>{% else %}<a class="badge warn" href="/integrations#crypto">нужен токен</a>{% endif %}</span></label>
+    </div>
+  </div>
+</div>
+<div class="savebar"><button class="btn">💾 Сохранить настройки</button><span class="hint">Изменения действуют в боте сразу, перезапуск не нужен</span></div>
+</form>
+{% endblock %}

@@ -1,0 +1,18 @@
+{% extends "base.html" %}{% block title %}Вход{% endblock %}
+{% block bare %}
+<div class="login-wrap">
+  <div class="card login">
+    <div class="logo">💎</div>
+    <h1 style="margin-bottom:4px">{{ shop_name }}</h1>
+    <p class="muted" style="margin:0 0 18px">Вход в панель управления ботом</p>
+    {% if error %}<div class="errbox">{{ error }}</div>{% endif %}
+    <form method="post">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <label>Пароль</label>
+      <input type="password" name="password" autofocus autocomplete="current-password" required>
+      <div class="actions"><button class="btn block">Войти</button></div>
+    </form>
+    <p class="hint" style="margin-top:16px">Забыли пароль? На сервере выполните <code>robux-bot password</code></p>
+  </div>
+</div>
+{% endblock %}

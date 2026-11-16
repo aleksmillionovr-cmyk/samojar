@@ -1,0 +1,29 @@
+{% extends "base.html" %}{% from "macros.html" import pager %}
+{% block title %}Покупатели{% endblock %}
+{% block content %}
+<h1>👥 Покупатели и пользователи</h1>
+<div class="tabs">{% for k, v in filters.items() %}<a href="?f={{ k }}{% if q %}&q={{ q|urlencode }}{% endif %}" class="{{ 'on' if f == k }}">{{ v[0] }}</a>{% endfor %}</div>
+<form class="toolbar-row" method="get"><input type="hidden" name="f" value="{{ f }}">
+  <input type="search" name="q" value="{{ q }}" placeholder="ID, @username или имя">
+  <button class="btn sec">Найти</button>{% if q %}<a class="ghost" href="?f={{ f }}">сбросить</a>{% endif %}
+  <span class="muted small" style="margin-left:auto">найдено: {{ total }}</span>
+</form>
+{% if rows %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Пользователь</th><th>ID</th><th>Покупок</th><th>Потратил</th><th>Впервые</th><th>Был</th><th></th></tr></thead>
+  <tbody>
+  {% for u in rows %}
+  <tr class="link" data-href="/users/{{ u.id }}">
+    <td><b>{{ ((u.first_name or '') ~ ' ' ~ (u.last_name or '')).strip() or '—' }}</b>{% if u.username %} <span class="muted">@{{ u.username }}</span>{% endif %}</td>
+    <td><code>{{ u.id }}</code></td>
+    <td>{{ u.paid_count }}</td>
+    <td class="nowrap">{{ u.spent|money if u.spent else '—' }}</td>
+    <td class="nowrap muted">{{ u.created_at|dt('%d.%m.%Y') }}</td>
+    <td class="nowrap muted">{{ u.last_seen|ago }}</td>
+    <td class="right">{% if u.banned %}<span class="badge bad">заблокирован</span>{% endif %}{% if u.bot_blocked %}<span class="badge">остановил бота</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
+{{ pager(page, pages) }}
+{% else %}<div class="card empty">Пока никого. Пользователи появятся, когда кто-то напишет боту.</div>{% endif %}
+{% endblock %}

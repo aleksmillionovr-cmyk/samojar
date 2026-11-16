@@ -2,62 +2,145 @@
 """
 Веб-админка магазина (Flask).
 Запускается вместе с ботом (python bot.py) или отдельно: python admin.py
-Адрес: http://<сервер>:<ADMIN_PORT>, пароль — ADMIN_PASSWORD из .env.
+Адрес: http(s)://<сервер>, пароль — ADMIN_PASSWORD из .env (потом можно сменить в админке → «Система»).
 
-Всё, что меняется здесь, сохраняется в catalog.json — бот подхватывает изменения сразу,
-без перезапуска.
+Всё, что меняется здесь, бот подхватывает сразу. Перезапуск нужен только после смены токена бота,
+админка делает его сама.
 """
+from __future__ import annotations
+
+import csv
+import hashlib
 import hmac
+import io
+import json
 import logging
+import math
 import os
 import re
 import secrets
+import sqlite3
+import sys
 import threading
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from html import escape
+from pathlib import Path
 
-from flask import (Flask, abort, flash, jsonify, redirect, render_template, request,
+from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template, request, send_file,
                    session, url_for)
-from jinja2 import DictLoader
 from markupsafe import Markup
-from werkzeug.serving import make_server
+from werkzeug.security import check_password_hash, generate_password_hash
 
+import boomkassa as BK
 import store as S
 
 log = logging.getLogger("robux_admin")
-
-TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3") or 3)  # часовой пояс для дат в админке (МСК = 3)
-BOT_USERNAME = ""
+BASE = Path(__file__).resolve().parent
 KINDS = {"sub": "Подписки", "svc": "Услуги"}
+VERSION = "2.0"
 
-try:
-    import telebot
-    TG = telebot.TeleBot(S.BOT_TOKEN, parse_mode="HTML") if S.BOT_TOKEN else None
-except ImportError:  # админку можно открыть и без telebot, но тогда она не пишет покупателям
-    TG = None
+# Бот при запуске передаёт сюда свои функции: завершение оплаты и уведомление админов.
+HOOKS: dict = {"paid": None, "alert": None, "bot_username": ""}
 
+
+def bot_username() -> str:
+    return HOOKS.get("bot_username") or (S.kv_get("bot_status", {}) or {}).get("username") or ""
+
+
+# ═══════════════════════════ TELEGRAM ИЗ АДМИНКИ ═══════════════════════════
+
+_tg: dict = {"token": None, "bot": None}
+
+
+def tg():
+    """TeleBot для отправки сообщений из админки (свой экземпляр, polling не запускает)."""
+    token = S.bot_token()
+    if not token:
+        return None
+    if _tg["token"] != token:
+        import telebot
+        _tg.update(token=token, bot=telebot.TeleBot(token, parse_mode="HTML", threaded=False))
+    return _tg["bot"]
+
+
+def tg_send(chat_id: int, text: str, kb=None) -> tuple:
+    """(успех, ошибка)."""
+    bot = tg()
+    if not bot:
+        return False, "токен бота не задан"
+    from telebot import types
+    try:
+        bot.send_message(chat_id, text, reply_markup=kb, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        log.warning("Админка: не удалось написать %s: %s", chat_id, e)
+        if "403" in str(e):
+            S.db_exec("UPDATE users SET bot_blocked = 1 WHERE id = ?", (chat_id,))
+        return False, str(e)
+
+
+def alert_admins(text: str) -> None:
+    if HOOKS.get("alert"):
+        HOOKS["alert"](text)
+        return
+    for admin_id in S.admin_ids():
+        tg_send(admin_id, text)
+
+
+def complete_paid(order_id: int, charge_id: str) -> bool:
+    """Оплата подтверждена (вебхук или вручную): через бота, если он запущен, иначе только в базе."""
+    if HOOKS.get("paid"):
+        return HOOKS["paid"](order_id, charge_id)
+    return S.mark_paid(order_id, charge_id)
+
+
+# ═══════════════════════════ ПРИЛОЖЕНИЕ ═══════════════════════════
 
 def _secret_key() -> str:
     path = S.DATA_DIR / ".admin_secret"
     if not path.exists():
-        path.write_text(secrets.token_hex(32), encoding="utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secrets.token_hex(32))
     return path.read_text(encoding="utf-8").strip()
 
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=str(BASE / "templates"), static_folder=str(BASE / "static"))
 app.secret_key = _secret_key()
 app.config.update(
+    SESSION_COOKIE_NAME="robux_admin",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=S.COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    MAX_CONTENT_LENGTH=5 * 1024 * 1024,
+    TEMPLATES_AUTO_RELOAD=False,
 )
+if S.TRUST_PROXY:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # ═══════════════════════════ ЗАЩИТА ═══════════════════════════
 
 _fails: dict = {}  # ip -> (кол-во ошибок, заблокирован до)
 MAX_FAILS, LOCK_SECONDS = 5, 600
+PUBLIC_PATHS = ("/login", "/healthz", "/webhook/", "/static/")
+
+
+def password_stamp() -> str:
+    """Меняется при смене пароля — старые сессии перестают работать."""
+    h = S.cfg("admin_password_hash") or hashlib.sha256(S.ADMIN_PASSWORD.encode()).hexdigest()
+    return hashlib.sha256(("stamp:" + h).encode()).hexdigest()[:16]
+
+
+def check_password(password: str) -> bool:
+    stored = S.cfg("admin_password_hash")
+    if stored:
+        return check_password_hash(stored, password)
+    return bool(S.ADMIN_PASSWORD) and hmac.compare_digest(password.encode(), S.ADMIN_PASSWORD.encode())
 
 
 def csrf_token() -> str:
@@ -67,11 +150,21 @@ def csrf_token() -> str:
 
 
 @app.before_request
-def _check_csrf():
+def _guard():
+    path = request.path
+    if path.startswith(PUBLIC_PATHS[1:]):
+        return None
     if request.method == "POST":
-        sent = request.form.get("csrf", "")
+        sent = request.form.get("csrf", "") or request.headers.get("X-CSRF", "")
         if not sent or not hmac.compare_digest(sent, session.get("csrf", "")):
             abort(400, "Страница устарела, обнови её и попробуй ещё раз")
+    if path == "/login":
+        return None
+    if not (session.get("ok") and session.get("pw") == password_stamp()):
+        if request.method == "GET":
+            return redirect(url_for("login", next=request.full_path.rstrip("?")))
+        abort(401)
+    return None
 
 
 @app.after_request
@@ -79,17 +172,25 @@ def _headers(resp):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"
-    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'")
+    if not request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
-def login_required(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        if not session.get("ok"):
-            return redirect(url_for("login", next=request.path))
-        return view(*args, **kwargs)
-    return wrapper
+@app.errorhandler(400)
+@app.errorhandler(401)
+@app.errorhandler(404)
+@app.errorhandler(500)
+def _error(e):
+    code = getattr(e, "code", 500)
+    if request.path.startswith("/webhook/") or request.accept_mimetypes.best == "application/json":
+        return jsonify(error=getattr(e, "description", str(e))), code
+    titles = {400: "Запрос не принят", 401: "Нужно войти", 404: "Страница не найдена", 500: "Ошибка сервера"}
+    return render_template("error.html", code=code, title=titles.get(code, "Ошибка"),
+                           text=getattr(e, "description", "")), code
 
 
 def check_kind(kind: str) -> None:
@@ -104,33 +205,56 @@ def tg_html(text: str) -> Markup:
     return Markup((text or "").replace("\n", "<br>"))
 
 
-def local_dt(iso: str) -> str:
+def local_dt(iso: str, fmt: str = "%d.%m %H:%M") -> str:
     if not iso:
         return "—"
-    dt = datetime.fromisoformat(iso) + timedelta(hours=TZ_OFFSET)
-    return dt.strftime("%d.%m %H:%M")
+    try:
+        dt = datetime.fromisoformat(iso) + timedelta(hours=S.TZ_OFFSET)
+    except ValueError:
+        return iso
+    return dt.strftime(fmt)
 
 
-def order_paid(o) -> str:
-    if o["currency"] == "XTR":
-        return f"{o['amount']} ⭐"
-    if o["currency"] == "USDT":
-        return f"{S.fmt(o['price'])} · {S.CRYPTO_ASSET}"
-    return f"{S.fmt(o['price'])} · карта"
+def ago(iso: str) -> str:
+    if not iso:
+        return "никогда"
+    try:
+        sec = (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return iso
+    if sec < 60:
+        return "только что"
+    if sec < 3600:
+        return f"{int(sec // 60)} мин назад"
+    if sec < 86400:
+        return f"{int(sec // 3600)} ч назад"
+    return f"{int(sec // 86400)} дн назад"
 
 
-app.jinja_env.filters.update(tg=tg_html, dt=local_dt, money=S.fmt)
-app.jinja_env.globals.update(csrf_token=csrf_token, STATUS=S.STATUS_NAMES, order_paid=order_paid)
+def mask(value: str) -> str:
+    if not value:
+        return ""
+    return value[:6] + "…" + value[-4:] if len(value) > 14 else "•" * len(value)
+
+
+app.jinja_env.filters.update(tg=tg_html, dt=local_dt, ago=ago, money=S.fmt, mask=mask)
+app.jinja_env.globals.update(csrf_token=csrf_token, STATUS=S.STATUS_NAMES, METHODS=S.METHOD_NAMES,
+                             order_paid=S.order_paid_line, VERSION=VERSION)
 
 
 @app.context_processor
 def _ctx():
     st = S.settings()
-    data = {"shop_name": st.get("shop_name", "Магазин"), "currency_sign": st.get("currency_sign", "₽")}
+    data = {"shop_name": st.get("shop_name", "Магазин"), "currency_sign": st.get("currency_sign", "₽"),
+            "maintenance": st.get("maintenance")}
     if session.get("ok"):
-        data["todo_count"] = S.db_one(
-            "SELECT COUNT(*) c FROM orders WHERE status IN ('paid', 'waiting')")["c"]
+        data["todo_count"] = S.db_one("SELECT COUNT(*) c FROM orders WHERE status IN ('paid', 'waiting')")["c"]
     return data
+
+
+def back_to(default: str):
+    nxt = request.form.get("back") or request.args.get("back") or default
+    return redirect(nxt if nxt.startswith("/") and not nxt.startswith("//") else default)
 
 
 # ═══════════════════════════ ВХОД ═══════════════════════════
@@ -143,18 +267,20 @@ def login():
     if request.method == "POST":
         if until > time.time():
             error = f"Слишком много попыток. Подожди {int((until - time.time()) // 60) + 1} мин."
-        elif S.ADMIN_PASSWORD and hmac.compare_digest(
-                request.form.get("password", "").encode(), S.ADMIN_PASSWORD.encode()):
+        elif check_password(request.form.get("password", "")):
             _fails.pop(ip, None)
             session.clear()
             session.permanent = True
-            session["ok"] = True
+            session.update(ok=True, pw=password_stamp())
+            log.info("Вход в админку с %s", ip)
             nxt = request.args.get("next", "/")
             return redirect(nxt if nxt.startswith("/") and not nxt.startswith("//") else "/")
         else:
             count += 1
             _fails[ip] = (count, time.time() + LOCK_SECONDS if count >= MAX_FAILS else 0)
+            log.warning("Неверный пароль в админке с %s (%s)", ip, count)
             error = "Неверный пароль"
+            time.sleep(0.6)
     return render_template("login.html", error=error)
 
 
@@ -164,16 +290,21 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
+
 # ═══════════════════════════ СВОДКА ═══════════════════════════
 
-def _since(days: int = 0) -> str:
-    """Начало сегодняшнего дня (по TZ_OFFSET) минус days, в UTC ISO."""
-    local_now = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET)
-    start = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
-    return (start - timedelta(hours=TZ_OFFSET)).isoformat(timespec="seconds")
+def day_start(days_ago: int = 0) -> str:
+    """Начало дня (по TZ_OFFSET) days_ago дней назад, в UTC ISO."""
+    local_now = datetime.now(timezone.utc) + timedelta(hours=S.TZ_OFFSET)
+    start = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    return (start - timedelta(hours=S.TZ_OFFSET)).isoformat(timespec="seconds")
 
 
-def _revenue(since_iso: str) -> dict:
+def revenue(since_iso: str) -> dict:
     row = S.db_one(
         "SELECT COUNT(*) n, COALESCE(SUM(price), 0) rub, "
         "COALESCE(SUM(CASE WHEN currency = 'XTR' THEN amount ELSE 0 END), 0) stars "
@@ -183,26 +314,107 @@ def _revenue(since_iso: str) -> dict:
     return dict(row)
 
 
+def daily_chart(days: int = 14) -> list:
+    rows = S.db_all("SELECT paid_at, price FROM orders WHERE status IN ('paid', 'waiting', 'done') AND paid_at >= ?",
+                    (day_start(days - 1),))
+    buckets: dict = {}
+    for r in rows:
+        d = (datetime.fromisoformat(r["paid_at"]) + timedelta(hours=S.TZ_OFFSET)).date()
+        n, s = buckets.get(d, (0, 0))
+        buckets[d] = (n + 1, s + r["price"])
+    today = (datetime.now(timezone.utc) + timedelta(hours=S.TZ_OFFSET)).date()
+    out = []
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        n, s = buckets.get(d, (0, 0))
+        out.append({"label": d.strftime("%d.%m"), "wd": "пн вт ср чт пт сб вс".split()[d.weekday()], "n": n, "sum": s})
+    peak = max((x["sum"] for x in out), default=0) or 1
+    for x in out:
+        x["h"] = round(x["sum"] / peak * 100)
+    return out
+
+
+def bot_state() -> dict:
+    st = S.kv_get("bot_status", {}) or {}
+    beat = S.kv_get("bot_heartbeat")
+    alive = False
+    if beat:
+        try:
+            alive = (datetime.now(timezone.utc) - datetime.fromisoformat(beat)).total_seconds() < 90
+        except ValueError:
+            pass
+    state = st.get("state", "unknown")
+    if state == "running" and not alive:
+        state = "stale"
+    labels = {
+        "running": ("ok", "работает"),
+        "stale": ("warn", "не отвечает"),
+        "no_token": ("bad", "не задан токен"),
+        "bad_token": ("bad", "Telegram не принял токен"),
+        "no_network": ("warn", "нет связи с Telegram"),
+        "unknown": ("warn", "запускается…"),
+    }
+    tone, text = labels.get(state, ("warn", state))
+    return {"state": state, "tone": tone, "text": text, "username": st.get("username") or bot_username(),
+            "since": st.get("at"), "error": S.kv_get("bot_error")}
+
+
+def setup_checklist() -> list:
+    st = S.settings()
+    bk_on = st.get("enable_boomkassa")
+    tariffs = BK.tariffs() if BK.configured() else []
+    items = [
+        ("Токен бота от @BotFather", bool(S.bot_token()) and bot_state()["state"] in ("running", "stale"),
+         "/integrations#telegram"),
+        ("Ваш Telegram ID для уведомлений о заказах", bool(S.admin_ids()), "/integrations#telegram"),
+        ("Ник техподдержки", st.get("support_username") not in ("", "your_support"), "/settings#shop"),
+    ]
+    if bk_on:
+        items += [
+            ("BoomKassa: API-ключ", BK.configured(), "/integrations#boomkassa"),
+            ("BoomKassa: тарифы для проекта", bool(tariffs), "/integrations#boomkassa"),
+            ("BoomKassa: секрет вебхука (автоподтверждение оплат)", bool(S.cfg("bk_webhook_secret")),
+             "/integrations#boomkassa"),
+        ]
+    return [{"text": t, "ok": ok, "url": u} for t, ok, u in items]
+
+
 @app.get("/")
-@login_required
 def dashboard():
-    todo = S.db_all("SELECT * FROM orders WHERE status IN ('paid', 'waiting') ORDER BY id LIMIT 50")
+    todo = S.db_all("SELECT * FROM orders WHERE status IN ('paid', 'waiting') ORDER BY id LIMIT 30")
     by_method = S.db_all(
-        "SELECT currency, COUNT(*) n, COALESCE(SUM(price), 0) rub FROM orders "
-        "WHERE status IN ('paid', 'waiting', 'done') AND paid_at >= ? GROUP BY currency",
-        (_since(29),),
+        "SELECT method, COUNT(*) n, COALESCE(SUM(price), 0) rub FROM orders "
+        "WHERE status IN ('paid', 'waiting', 'done') AND paid_at >= ? GROUP BY method ORDER BY rub DESC",
+        (day_start(29),),
     )
     top = S.db_all(
         "SELECT title, COUNT(*) n, COALESCE(SUM(price), 0) rub FROM orders "
-        "WHERE status IN ('paid', 'waiting', 'done') AND paid_at >= ? GROUP BY title ORDER BY rub DESC LIMIT 5",
-        (_since(29),),
+        "WHERE status IN ('paid', 'waiting', 'done') AND paid_at >= ? GROUP BY title ORDER BY rub DESC LIMIT 6",
+        (day_start(29),),
     )
+    people = S.db_one(
+        "SELECT COUNT(*) total, "
+        "SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) today, "
+        "SUM(CASE WHEN bot_blocked = 1 THEN 1 ELSE 0 END) blocked FROM users", (day_start(0),))
     buyers = S.db_one("SELECT COUNT(DISTINCT user_id) c FROM orders WHERE status IN ('paid', 'waiting', 'done')")["c"]
+    checklist = setup_checklist()
     return render_template(
         "dashboard.html", active="dash", todo=todo,
-        today=_revenue(_since(0)), week=_revenue(_since(6)), month=_revenue(_since(29)),
-        by_method=by_method, top=top, buyers=buyers,
+        today=revenue(day_start(0)), week=revenue(day_start(6)), month=revenue(day_start(29)),
+        total=revenue("2000-01-01"), by_method=by_method, top=top, buyers=buyers, people=people,
+        chart=daily_chart(14), bot=bot_state(), checklist=checklist,
+        checklist_left=sum(1 for c in checklist if not c["ok"]), methods=S.enabled_methods(),
     )
+
+
+@app.post("/maintenance")
+def toggle_maintenance():
+    data = S.edit_catalog()
+    data["settings"]["maintenance"] = not data["settings"].get("maintenance")
+    S.save_catalog(data)
+    flash("🛠 Технический перерыв включён: бот отвечает только админам" if data["settings"]["maintenance"]
+          else "✅ Технический перерыв выключен, магазин снова работает")
+    return back_to("/")
 
 
 # ═══════════════════════════ ЗАКАЗЫ ═══════════════════════════
@@ -211,83 +423,361 @@ ORDER_FILTERS = {
     "todo": ("Ждут выдачи", "status IN ('paid', 'waiting')"),
     "done": ("Выполнены", "status = 'done'"),
     "paid": ("Все оплаченные", "status IN ('paid', 'waiting', 'done')"),
-    "other": ("Не оплачены / отменены", "status IN ('created', 'cancelled')"),
+    "created": ("Не оплачены", "status = 'created'"),
+    "cancelled": ("Отменены и возвраты", "status IN ('cancelled', 'refunded')"),
+    "all": ("Все", "1 = 1"),
 }
+PER_PAGE = 40
 
 
-@app.get("/orders")
-@login_required
-def orders():
+def orders_query():
     f = request.args.get("f", "todo")
     if f not in ORDER_FILTERS:
         f = "todo"
     q = request.args.get("q", "").strip().lstrip("#@")
-    sql, params = f"SELECT * FROM orders WHERE {ORDER_FILTERS[f][1]}", []
+    method = request.args.get("m", "")
+    where, params = [ORDER_FILTERS[f][1]], []
     if q:
-        sql += " AND (CAST(id AS TEXT) = ? OR nick LIKE ? OR username LIKE ? OR CAST(user_id AS TEXT) = ?)"
-        params += [q, f"%{q}%", f"%{q}%", q]
-    sql += " ORDER BY id DESC LIMIT 200"
-    return render_template("orders.html", active="orders", rows=S.db_all(sql, tuple(params)),
-                           f=f, q=q, filters=ORDER_FILTERS)
+        where.append("(CAST(id AS TEXT) = ? OR nick LIKE ? OR username LIKE ? OR CAST(user_id AS TEXT) = ? "
+                     "OR title LIKE ? OR ext_id = ?)")
+        params += [q, f"%{q}%", f"%{q}%", q, f"%{q}%", q]
+    if method in S.METHOD_NAMES:
+        where.append("method = ?")
+        params.append(method)
+    return f, q, method, " AND ".join(where), params
 
 
-def _back_to_orders():
-    return redirect(request.form.get("back") or url_for("orders"))
-
-
-@app.post("/orders/<int:order_id>/done")
-@login_required
-def order_done(order_id: int):
-    order = S.get_order(order_id)
-    if not order:
-        abort(404)
-    S.set_status(order_id, "done")
-    if _tg_send(order["user_id"], S.done_message(order)):
-        flash(f"✅ Заказ #{order_id} выполнен, покупатель получил уведомление")
-    else:
-        flash(f"Заказ #{order_id} отмечен выполненным, но написать покупателю не получилось", "error")
-    return _back_to_orders()
-
-
-@app.post("/orders/<int:order_id>/send")
-@login_required
-def order_send(order_id: int):
-    order = S.get_order(order_id)
-    if not order:
-        abort(404)
-    body = (request.form.get("text") or "").strip()
-    if not body:
-        flash("Пустое сообщение не отправлено", "error")
-        return _back_to_orders()
-    content = f"<code>{escape(body)}</code>" if request.form.get("as") == "code" else escape(body)
-    text = f"📬 <b>Заказ #{order_id}</b>\n📦 {escape(order['title'])}\n\n{content}"
-    if _tg_send(order["user_id"], text):
-        if request.form.get("close") == "on":
-            S.set_status(order_id, "done")
-        flash(f"📩 Отправлено покупателю по заказу #{order_id}")
-    else:
-        flash("Не получилось отправить: покупатель мог заблокировать бота", "error")
-    return _back_to_orders()
-
-
-def _tg_send(chat_id: int, text: str) -> bool:
-    if not TG:
-        return False
+def page_args(total: int) -> tuple:
+    pages = max(1, math.ceil(total / PER_PAGE))
     try:
-        TG.send_message(chat_id, text)
-        return True
-    except Exception as e:  # noqa: BLE001
-        log.warning("Админка: не удалось написать %s: %s", chat_id, e)
-        return False
+        page = min(max(1, int(request.args.get("page", 1))), pages)
+    except ValueError:
+        page = 1
+    return page, pages, (page - 1) * PER_PAGE
+
+
+@app.get("/orders")
+def orders():
+    f, q, method, where, params = orders_query()
+    total = S.db_one(f"SELECT COUNT(*) c FROM orders WHERE {where}", tuple(params))["c"]
+    page, pages, offset = page_args(total)
+    rows = S.db_all(f"SELECT * FROM orders WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (*params, PER_PAGE, offset))
+    counts = {k: S.db_one(f"SELECT COUNT(*) c FROM orders WHERE {v[1]}")["c"] for k, v in ORDER_FILTERS.items()}
+    return render_template("orders.html", active="orders", rows=rows, f=f, q=q, m=method, filters=ORDER_FILTERS,
+                           counts=counts, total=total, page=page, pages=pages)
+
+
+@app.get("/orders.csv")
+def orders_csv():
+    _, _, _, where, params = orders_query()
+    rows = S.db_all(f"SELECT * FROM orders WHERE {where} ORDER BY id DESC", tuple(params))
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["№", "Создан", "Оплачен", "Статус", "Позиция", "Цена", "Валюта", "Сумма в счёте", "Способ",
+                "Покупатель", "Telegram ID", "Ник Roblox", "ID платежа", "Заметка"])
+    for o in rows:
+        w.writerow([o["id"], local_dt(o["created_at"], "%d.%m.%Y %H:%M"), local_dt(o["paid_at"], "%d.%m.%Y %H:%M"),
+                    S.STATUS_NAMES.get(o["status"], o["status"]), o["title"], o["price"], o["currency"], o["amount"],
+                    S.METHOD_NAMES.get(o["method"], o["method"]), o["username"], o["user_id"], o["nick"] or "",
+                    o["charge_id"] or "", o["note"] or ""])
+    name = f"orders_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    return Response("﻿" + buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
+
+
+def get_order_or_404(order_id: int):
+    order = S.get_order(order_id)
+    if not order:
+        abort(404)
+    return order
+
+
+@app.get("/orders/<int:order_id>")
+def order_page(order_id: int):
+    o = get_order_or_404(order_id)
+    user = S.get_user(o["user_id"])
+    others = S.db_all("SELECT * FROM orders WHERE user_id = ? AND id != ? ORDER BY id DESC LIMIT 10",
+                      (o["user_id"], order_id))
+    item = S.get_item(o["kind"], o["item_key"], only_active=False)
+    return render_template("order.html", active="orders", o=o, user=user, others=others, item=item)
+
+
+@app.post("/orders/<int:order_id>/<action>")
+def order_action(order_id: int, action: str):
+    o = get_order_or_404(order_id)
+    back = f"/orders/{order_id}"
+    if action == "done":
+        S.set_status(order_id, "done")
+        ok, err = tg_send(o["user_id"], S.done_message(o))
+        if ok:
+            flash(f"✅ Заказ #{order_id} выполнен, покупатель получил уведомление")
+        else:
+            flash(f"Заказ #{order_id} отмечен выполненным, но написать покупателю не получилось: {err}", "error")
+    elif action == "send":
+        body = (request.form.get("text") or "").strip()
+        if not body:
+            flash("Пустое сообщение не отправлено", "error")
+            return back_to(back)
+        content = f"<code>{escape(body)}</code>" if request.form.get("as") == "code" else escape(body)
+        ok, err = tg_send(o["user_id"], f"📬 <b>Заказ #{order_id}</b>\n📦 {escape(o['title'])}\n\n{content}")
+        if ok:
+            if request.form.get("close") == "on":
+                S.set_status(order_id, "done")
+            flash(f"📩 Отправлено покупателю по заказу #{order_id}")
+        else:
+            flash(f"Не получилось отправить: {err}", "error")
+    elif action == "paid":
+        if o["status"] not in ("created", "cancelled"):
+            flash("Заказ уже оплачен", "error")
+        elif complete_paid(order_id, f"manual:{datetime.now().strftime('%Y%m%d%H%M%S')}"):
+            note = (o["note"] or "") + "\nОплата подтверждена вручную в админке"
+            S.set_order_fields(order_id, note=note.strip())
+            flash(f"💰 Заказ #{order_id} отмечен оплаченным. Покупатель получил уведомление, если бот запущен")
+    elif action == "status":
+        status = request.form.get("status", "")
+        if status not in S.STATUS_NAMES:
+            abort(400)
+        if status in ("paid", "waiting", "done") and o["status"] in ("created", "cancelled") and not o["paid_at"]:
+            S.db_exec("UPDATE orders SET paid_at = ? WHERE id = ?", (S.now_iso(), order_id))
+        S.set_status(order_id, status)
+        flash(f"Статус заказа #{order_id}: {S.STATUS_NAMES[status]}")
+    elif action == "note":
+        S.set_order_fields(order_id, note=(request.form.get("note") or "").strip()[:2000])
+        flash("📝 Заметка сохранена")
+    elif action == "nick":
+        nick = (request.form.get("nick") or "").strip().lstrip("@")
+        if nick and not re.fullmatch(r"[A-Za-z0-9_]{3,20}", nick):
+            flash("Ник в Roblox: 3–20 латинских букв, цифр или _", "error")
+        else:
+            S.set_order_fields(order_id, nick=nick or None)
+            if nick and o["status"] == "paid":
+                S.set_status(order_id, "waiting")
+            flash("🎮 Ник сохранён")
+    elif action == "refund_stars":
+        if o["currency"] != "XTR" or not o["charge_id"] or o["status"] == "refunded":
+            flash("Вернуть звёзды можно только по оплаченному заказу в Stars", "error")
+        else:
+            bot = tg()
+            try:
+                bot.refund_star_payment(o["user_id"], o["charge_id"])
+                S.set_status(order_id, "refunded")
+                flash(f"↩️ {o['amount']} ⭐ возвращены покупателю, заказ #{order_id} помечен как возврат")
+            except Exception as e:  # noqa: BLE001
+                flash(f"Telegram не выполнил возврат: {e}", "error")
+    else:
+        abort(404)
+    return back_to(back)
+
+
+# ═══════════════════════════ ПОЛЬЗОВАТЕЛИ ═══════════════════════════
+
+USER_FILTERS = {
+    "all": ("Все", "1 = 1"),
+    "buyers": ("Покупатели", "spent > 0"),
+    "new": ("Новые за 7 дней", "u.created_at >= :week"),
+    "banned": ("Заблокированы", "u.banned = 1"),
+    "left": ("Остановили бота", "u.bot_blocked = 1"),
+}
+USERS_SQL = """
+SELECT * FROM (
+  SELECT u.*,
+    (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id AND o.status IN ('paid','waiting','done')) AS paid_count,
+    (SELECT COALESCE(SUM(price),0) FROM orders o WHERE o.user_id = u.id AND o.status IN ('paid','waiting','done'))
+      AS spent
+  FROM users u
+) u WHERE {where}
+"""
+
+
+@app.get("/users")
+def users():
+    f = request.args.get("f", "all")
+    if f not in USER_FILTERS:
+        f = "all"
+    q = request.args.get("q", "").strip().lstrip("@")
+    where = USER_FILTERS[f][1]
+    params: dict = {"week": day_start(6)}
+    if q:
+        where += " AND (CAST(u.id AS TEXT) = :q OR u.username LIKE :ql OR u.first_name LIKE :ql OR u.last_name LIKE :ql)"
+        params.update(q=q, ql=f"%{q}%")
+    sql = USERS_SQL.format(where=where)
+    total = S.db_one(f"SELECT COUNT(*) c FROM ({sql})", params)["c"]
+    page, pages, offset = page_args(total)
+    rows = S.db_all(sql + " ORDER BY u.last_seen DESC LIMIT :lim OFFSET :off", {**params, "lim": PER_PAGE, "off": offset})
+    return render_template("users.html", active="users", rows=rows, f=f, q=q, filters=USER_FILTERS, total=total,
+                           page=page, pages=pages)
+
+
+@app.get("/users/<int:user_id>")
+def user_page(user_id: int):
+    user = S.get_user(user_id)
+    rows = S.db_all("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 100", (user_id,))
+    if not user and not rows:
+        abort(404)
+    spent = sum(r["price"] for r in rows if r["status"] in S.PAID_STATUSES)
+    return render_template("user.html", active="users", user=user, uid=user_id, rows=rows, spent=spent,
+                           discount=S.user_discount(user_id), is_admin=S.is_admin(user_id))
+
+
+@app.post("/users/<int:user_id>/<action>")
+def user_action(user_id: int, action: str):
+    if not S.get_user(user_id):
+        S.db_exec("INSERT OR IGNORE INTO users (id, created_at, last_seen) VALUES (?, ?, ?)",
+                  (user_id, S.now_iso(), S.now_iso()))
+    back = f"/users/{user_id}"
+    if action == "ban":
+        user = S.get_user(user_id)
+        S.set_user_flag(user_id, "banned", 0 if user["banned"] else 1)
+        flash("⛔ Пользователь заблокирован в боте" if not user["banned"] else "✅ Пользователь разблокирован")
+    elif action == "note":
+        S.set_user_flag(user_id, "note", (request.form.get("note") or "").strip()[:2000])
+        flash("📝 Заметка сохранена")
+    elif action == "message":
+        text = (request.form.get("text") or "").strip()
+        errs = S.html_errors(text)
+        if not text or errs:
+            flash("Сообщение не отправлено: " + ("пустой текст" if not text else "; ".join(errs)), "error")
+        else:
+            ok, err = tg_send(user_id, text)
+            flash("📩 Сообщение отправлено" if ok else f"Не получилось отправить: {err}", None if ok else "error")
+    else:
+        abort(404)
+    return back_to(back)
+
+
+# ═══════════════════════════ РАССЫЛКА ═══════════════════════════
+
+AUDIENCES = {
+    "all": ("Все пользователи", "SELECT id FROM users WHERE banned = 0 AND bot_blocked = 0"),
+    "buyers": ("Только покупатели",
+               "SELECT id FROM users WHERE banned = 0 AND bot_blocked = 0 AND id IN "
+               "(SELECT user_id FROM orders WHERE status IN ('paid','waiting','done'))"),
+    "nonbuyers": ("Кто ещё ничего не купил",
+                  "SELECT id FROM users WHERE banned = 0 AND bot_blocked = 0 AND id NOT IN "
+                  "(SELECT user_id FROM orders WHERE status IN ('paid','waiting','done'))"),
+    "admins": ("Тест: только админам", None),
+}
+_bc_stop: set = set()
+
+
+def audience_ids(aud: str) -> list:
+    if aud == "admins":
+        return S.admin_ids()
+    return [r["id"] for r in S.db_all(AUDIENCES[aud][1])]
+
+
+def run_broadcast(bid: int) -> None:
+    from telebot import types
+    from telebot.apihelper import ApiTelegramException
+
+    row = S.db_one("SELECT * FROM broadcasts WHERE id = ?", (bid,))
+    ids = audience_ids(row["audience"])
+    S.db_exec("UPDATE broadcasts SET total = ? WHERE id = ?", (len(ids), bid))
+    bot = tg()
+    kb = None
+    if row["button_text"] and row["button_url"]:
+        kb = types.InlineKeyboardMarkup()
+        kb.row(types.InlineKeyboardButton(row["button_text"], url=row["button_url"]))
+    sent = failed = 0
+    status = "done"
+    for n, uid in enumerate(ids, 1):
+        if bid in _bc_stop:
+            status = "stopped"
+            break
+        for attempt in range(3):
+            try:
+                bot.send_message(uid, row["text"], reply_markup=kb,
+                                 link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+                sent += 1
+                break
+            except ApiTelegramException as e:
+                if e.error_code == 429 and attempt < 2:
+                    time.sleep(int((e.result_json or {}).get("parameters", {}).get("retry_after", 5)) + 1)
+                    continue
+                if e.error_code == 403:
+                    S.db_exec("UPDATE users SET bot_blocked = 1 WHERE id = ?", (uid,))
+                failed += 1
+                break
+            except Exception as e:  # noqa: BLE001
+                log.warning("Рассылка #%s: %s", bid, e)
+                failed += 1
+                time.sleep(2)
+                break
+        if n % 10 == 0:
+            S.db_exec("UPDATE broadcasts SET sent = ?, failed = ? WHERE id = ?", (sent, failed, bid))
+        time.sleep(0.05)  # ~20 сообщений в секунду, лимит Telegram — 30
+    S.db_exec("UPDATE broadcasts SET sent = ?, failed = ?, status = ?, finished_at = ? WHERE id = ?",
+              (sent, failed, status, S.now_iso(), bid))
+    _bc_stop.discard(bid)
+    log.info("Рассылка #%s: %s, отправлено %s, ошибок %s", bid, status, sent, failed)
+
+
+@app.route("/broadcast", methods=["GET", "POST"])
+def broadcast():
+    form = {"text": "", "button_text": "", "button_url": "", "audience": "all"}
+    errors = []
+    if request.method == "POST":
+        form = {k: (request.form.get(k) or "").replace("\r\n", "\n").strip() for k in form}
+        if form["audience"] not in AUDIENCES:
+            abort(400)
+        if not form["text"]:
+            errors.append("Напиши текст рассылки")
+        errors += S.html_errors(form["text"])
+        if len(form["text"]) > 4000:
+            errors.append("Текст длиннее 4000 символов")
+        if bool(form["button_text"]) != bool(form["button_url"]):
+            errors.append("Для кнопки нужны и подпись, и ссылка")
+        if form["button_url"] and not re.match(r"^(https?://|tg://)", form["button_url"]):
+            errors.append("Ссылка кнопки должна начинаться с https:// или tg://")
+        if not tg():
+            errors.append("Бот не подключён: задай токен в «Подключениях»")
+        if S.db_one("SELECT 1 FROM broadcasts WHERE status = 'running'"):
+            errors.append("Уже идёт другая рассылка, дождись её окончания или останови")
+        if not errors:
+            cur = S.db_exec(
+                "INSERT INTO broadcasts (text, button_text, button_url, audience, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'running', ?)",
+                (form["text"], form["button_text"] or None, form["button_url"] or None, form["audience"], S.now_iso()))
+            threading.Thread(target=run_broadcast, args=(cur.lastrowid,), name="broadcast", daemon=True).start()
+            flash(f"📣 Рассылка запущена: {AUDIENCES[form['audience']][0].lower()}")
+            return redirect(url_for("broadcast"))
+    counts = {k: len(audience_ids(k)) for k in AUDIENCES}
+    history = S.db_all("SELECT * FROM broadcasts ORDER BY id DESC LIMIT 20")
+    return render_template("broadcast.html", active="broadcast", form=form, errors=errors, audiences=AUDIENCES,
+                           counts=counts, history=history)
+
+
+@app.get("/broadcast/<int:bid>.json")
+def broadcast_status(bid: int):
+    row = S.db_one("SELECT id, status, total, sent, failed FROM broadcasts WHERE id = ?", (bid,))
+    if not row:
+        abort(404)
+    return jsonify(dict(row))
+
+
+@app.post("/broadcast/<int:bid>/stop")
+def broadcast_stop(bid: int):
+    _bc_stop.add(bid)
+    flash("⏹ Рассылка останавливается")
+    return redirect(url_for("broadcast"))
+
+
+@app.post("/preview/message")
+def preview_message():
+    text = (request.form.get("value") or "").replace("\r\n", "\n").strip()
+    buttons = [[request.form.get("button")]] if request.form.get("button") else []
+    return jsonify(html=str(tg_html(text)), buttons=buttons, errors=S.html_errors(text))
 
 
 # ═══════════════════════════ ПОДПИСКИ И УСЛУГИ ═══════════════════════════
 
 NEW_DEFAULTS = {
     "sub": {"emoji": "⭐", "name": "", "period": "Навсегда", "price": "", "discount": 0, "days": None,
-            "needs_nick": True, "active": True, "short": "", "about": "", "includes": [], "term": "", "how": ""},
+            "needs_nick": True, "active": True, "short": "", "about": "", "includes": [], "term": "", "how": "",
+            "bk_tariff": ""},
     "svc": {"emoji": "🎁", "name": "", "amount": "", "price": "", "needs_nick": True, "nick_prompt": "",
-            "active": True, "short": "", "text": ""},
+            "active": True, "short": "", "text": "", "bk_tariff": ""},
 }
 
 
@@ -325,6 +815,7 @@ def item_from_form(kind: str, form, base: dict):
         errs.append("Короткое описание длиннее 200 символов")
     it["needs_nick"] = form.get("needs_nick") == "on"
     it["active"] = form.get("active") == "on"
+    it["bk_tariff"] = g("bk_tariff")
 
     plain = [("Эмодзи", it["emoji"]), ("Название", it["name"])]
     if kind == "sub":
@@ -382,17 +873,32 @@ def list_buttons(kind: str):
     return rows + [["⬅️ Назад"]]
 
 
+def bk_status_for(item: dict) -> dict:
+    """Как позиция будет оплачиваться через BoomKassa (для списка и карточки)."""
+    if not S.settings().get("enable_boomkassa") or not BK.configured():
+        return {"tone": "", "text": ""}
+    t = BK.pick_tariff(item, int(item.get("price") or 0))
+    if not t:
+        if item.get("bk_tariff"):
+            return {"tone": "bad", "text": f"тариф {item['bk_tariff']} не найден"}
+        return {"tone": "warn", "text": "нет тарифа BoomKassa на эту сумму"}
+    amount = BK.amount_of(t)
+    if amount != int(item.get("price") or 0):
+        return {"tone": "warn", "text": f"BoomKassa: {t['code']} · {S.fmt(amount)} (≠ цене)"}
+    return {"tone": "ok", "text": f"BoomKassa: {t['code']}"}
+
+
 @app.get("/items/<kind>")
-@login_required
 def items_list(kind: str):
     check_kind(kind)
-    screen = S.subs_text() if kind == "sub" else S.services_text(BOT_USERNAME)
-    return render_template("items.html", active=kind, kind=kind, title=KINDS[kind],
-                           lst=S.items(kind, only_active=False), screen=screen, buttons=list_buttons(kind))
+    screen = S.subs_text() if kind == "sub" else S.services_text(bot_username())
+    lst = S.items(kind, only_active=False)
+    return render_template("items.html", active=kind, kind=kind, title=KINDS[kind], lst=lst,
+                           bk={it["key"]: bk_status_for(it) for it in lst},
+                           screen=screen, buttons=list_buttons(kind))
 
 
 @app.route("/items/<kind>/<key>", methods=["GET", "POST"])
-@login_required
 def item_edit(kind: str, key: str):
     check_kind(kind)
     data = S.edit_catalog()
@@ -420,11 +926,12 @@ def item_edit(kind: str, key: str):
         base = item
 
     return render_template("item_form.html", active=kind, kind=kind, title=KINDS[kind],
-                           item=base, is_new=is_new, key=key, errors=errors)
+                           item=base, is_new=is_new, key=key, errors=errors,
+                           tariffs=BK.tariffs() if BK.configured() else [],
+                           bk_on=S.settings().get("enable_boomkassa"))
 
 
 @app.post("/items/<kind>/<key>/<action>")
-@login_required
 def item_action(kind: str, key: str, action: str):
     check_kind(kind)
     data = S.edit_catalog()
@@ -438,7 +945,15 @@ def item_action(kind: str, key: str, action: str):
         flash(f"🗑 «{name}» удалено")
     elif action == "toggle":
         lst[idx]["active"] = not lst[idx].get("active", True)
-        flash(f"{'👁 «' + name + '» снова в боте' if lst[idx]['active'] else '🙈 «' + name + '» скрыто из бота'}")
+        flash(f"👁 «{name}» снова в боте" if lst[idx]["active"] else f"🙈 «{name}» скрыто из бота")
+    elif action == "copy":
+        clone = json.loads(json.dumps(lst[idx]))
+        existing = {x["key"] for x in lst}
+        clone["key"] = next(k for k in iter(lambda: secrets.token_hex(4), None) if k not in existing)
+        clone["name"] = (clone["name"] + " (копия)")[:40]
+        clone["active"] = False
+        lst.insert(idx + 1, clone)
+        flash(f"📄 Создана копия «{name}» (скрыта из бота, пока не включишь)")
     elif action in ("up", "down"):
         j = idx - 1 if action == "up" else idx + 1
         if 0 <= j < len(lst):
@@ -450,43 +965,60 @@ def item_action(kind: str, key: str, action: str):
 
 
 @app.post("/preview/item/<kind>")
-@login_required
 def preview_item(kind: str):
     check_kind(kind)
     base = S.get_item(kind, request.form.get("key", ""), only_active=False) or dict(NEW_DEFAULTS[kind])
     item, errors = item_from_form(kind, request.form, base)
-    return jsonify(html=str(tg_html(S.card_text(kind, item))), buttons=preview_buttons(kind, item), errors=errors)
+    return jsonify(html=str(tg_html(S.card_text(kind, item))), buttons=preview_buttons(kind, item), errors=errors,
+                   bk=bk_status_for(item))
 
 
 # ═══════════════════════════ ТЕКСТЫ ═══════════════════════════
 
-TEXT_FIELDS = [
-    ("welcome", "👋 Приветствие", "Показывается на /start и по кнопке «Меню». "
-                                 "Подстановки: {name} — имя покупателя, {shop} — название магазина, {support} — ник поддержки"),
-    ("subs_header", "💎 Шапка раздела «Подписки»", "Под ней бот сам добавит список тарифов с ценами и кнопки"),
-    ("services_header", "🛍 Шапка раздела «Услуги»", "Под ней бот сам добавит кликабельный список услуг"),
-    ("services_footer", "🛍 Подвал раздела «Услуги»", "{support} — ник поддержки"),
-    ("support", "🆘 Техподдержка", "{support} — ник поддержки; кнопка «Написать в поддержку» добавится сама"),
-    ("nick_prompt", "✍️ Просьба прислать ник после оплаты", "Для отдельной услуги можно задать свой текст в её карточке"),
+TEXT_GROUPS = [
+    ("Главные экраны", [
+        ("welcome", "👋 Приветствие", "Показывается на /start и по кнопке «Меню». "
+                                     "{name} — имя покупателя, {shop} — название магазина, {support} — ник поддержки"),
+        ("subs_header", "💎 Шапка раздела «Подписки»", "Под ней бот сам добавит список тарифов с ценами и кнопки"),
+        ("services_header", "🛍 Шапка раздела «Услуги»", "Под ней бот сам добавит кликабельный список услуг"),
+        ("services_footer", "🛍 Подвал раздела «Услуги»", "{support} — ник поддержки"),
+        ("support", "🆘 Техподдержка", "{support} — ник поддержки; кнопка «Написать в поддержку» добавится сама"),
+    ]),
+    ("Заказ и выдача", [
+        ("paid", "✅ Оплата прошла", "{order} — номер заказа, {title} — что куплено, {shop} — магазин"),
+        ("nick_prompt", "✍️ Просьба прислать ник после оплаты",
+         "Для отдельной услуги можно задать свой текст в её карточке"),
+        ("nick_saved", "🙌 Ник принят", "{nick} — ник, {order} — номер заказа"),
+        ("in_work", "⏳ Заказ в работе (когда ник не нужен)", "{order} — номер заказа, {title} — что куплено"),
+        ("done", "🎉 Заказ выполнен", "Уходит покупателю по кнопке «✅ Выдано». {order}, {title}, {shop}"),
+        ("my_orders_empty", "🧾 «Мои заказы», когда заказов нет", ""),
+    ]),
+    ("Служебные", [
+        ("maintenance", "🛠 Технический перерыв", "Включается в «Настройках» или кнопкой на сводке. {support}"),
+        ("banned", "⛔ Пользователь заблокирован", "{support} — ник поддержки"),
+        ("unknown", "🤔 Бот не понял сообщение", ""),
+    ]),
 ]
-TEXT_KEYS = [k for k, _, _ in TEXT_FIELDS]
+TEXT_KEYS = [k for _, fields in TEXT_GROUPS for k, _, _ in fields]
+SAMPLE_ORDER = {"order": 1234, "title": "⚡ Быстрые робуксы — 500 R$", "nick": "Builderman"}
 
 
 def render_text_screen(field: str, tx: dict):
     """Текст и кнопки экрана, как их увидит покупатель."""
     if field == "welcome":
-        return S.welcome_text("Гоша", tx), [["💎 Подписки", "🛍 Услуги"], ["🆘 Техподдержка"]]
+        return S.welcome_text("Гоша", tx), [["💎 Подписки", "🛍 Услуги"], ["🧾 Мои заказы", "🆘 Поддержка"]]
     if field == "subs_header":
         return S.subs_text(tx), list_buttons("sub")
     if field in ("services_header", "services_footer"):
-        return S.services_text(BOT_USERNAME, tx), list_buttons("svc")
+        return S.services_text(bot_username(), tx), list_buttons("svc")
     if field == "support":
         return S.support_text(tx), [["✉️ Написать в поддержку"], ["⬅️ Назад"]]
-    return tx[field], []
+    if field == "my_orders_empty":
+        return S.render(field, tx), [["💎 Подписки", "🛍 Услуги"]]
+    return S.render(field, tx, **SAMPLE_ORDER), []
 
 
 @app.route("/texts", methods=["GET", "POST"])
-@login_required
 def texts_page():
     data = S.edit_catalog()
     tx = data["texts"]
@@ -503,11 +1035,10 @@ def texts_page():
             flash("✅ Тексты сохранены, бот уже показывает новые")
             return redirect(url_for("texts_page"))
     screens = {k: render_text_screen(k, tx) for k in TEXT_KEYS}
-    return render_template("texts.html", active="texts", fields=TEXT_FIELDS, tx=tx, errors=errors, screens=screens)
+    return render_template("texts.html", active="texts", groups=TEXT_GROUPS, tx=tx, errors=errors, screens=screens)
 
 
 @app.post("/preview/text")
-@login_required
 def preview_text():
     field = request.form.get("field", "")
     if field not in TEXT_KEYS:
@@ -518,10 +1049,13 @@ def preview_text():
     return jsonify(html=str(tg_html(html)), buttons=buttons, errors=S.html_errors(tx[field]))
 
 
-# ═══════════════════════════ НАСТРОЙКИ ═══════════════════════════
+# ═══════════════════════════ НАСТРОЙКИ МАГАЗИНА ═══════════════════════════
+
+BUTTON_FIELDS = [("btn_subs", "Подписки"), ("btn_services", "Услуги"), ("btn_orders", "Мои заказы"),
+                 ("btn_support", "Поддержка"), ("btn_menu", "Меню")]
+
 
 @app.route("/settings", methods=["GET", "POST"])
-@login_required
 def settings_page():
     data = S.edit_catalog()
     st = data["settings"]
@@ -534,15 +1068,29 @@ def settings_page():
             "support_username": (f.get("support_username") or "").strip().lstrip("@"),
             "welcome_sticker": (f.get("welcome_sticker") or "").strip(),
             "enable_stars": f.get("enable_stars") == "on",
+            "enable_boomkassa": f.get("enable_boomkassa") == "on",
             "enable_card": f.get("enable_card") == "on",
             "enable_crypto": f.get("enable_crypto") == "on",
+            "bk_label": (f.get("bk_label") or "").strip() or "💳 Карта / СБП",
+            "card_label": (f.get("card_label") or "").strip() or "💳 Картой в Telegram",
+            "maintenance": f.get("maintenance") == "on",
+            "notify_new_users": f.get("notify_new_users") == "on",
         }
+        for key, label in BUTTON_FIELDS:
+            new[key] = (f.get(key) or "").strip()
+            if not new[key] or len(new[key]) > 30:
+                errors.append(f"Кнопка «{label}»: от 1 до 30 символов")
+        if len(set(new[k] for k, _ in BUTTON_FIELDS)) < len(BUTTON_FIELDS):
+            errors.append("Подписи кнопок не должны повторяться")
         if not new["shop_name"] or len(new["shop_name"]) > 40 or re.search(r"[<>&]", new["shop_name"]):
             errors.append("Название магазина: от 1 до 40 символов, без &lt; &gt; &amp;")
         if not new["currency_sign"] or len(new["currency_sign"]) > 4:
             errors.append("Знак валюты: 1–4 символа")
         if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", new["support_username"]):
             errors.append("Ник поддержки: 4–32 латинских буквы, цифры или _")
+        for label_key in ("bk_label", "card_label"):
+            if len(new[label_key]) > 30:
+                errors.append("Подпись способа оплаты: до 30 символов")
         try:
             rate = float((f.get("rub_per_star") or "").replace(",", "."))
             if not 0.01 <= rate <= 1000:
@@ -551,458 +1099,338 @@ def settings_page():
         except ValueError:
             errors.append("Курс звезды: число больше 0, например 1.8")
             new["rub_per_star"] = st.get("rub_per_star", 1.8)
+        ttl = _int(f.get("order_ttl_hours"))
+        if ttl is None or not 1 <= ttl <= 720:
+            errors.append("Срок жизни неоплаченного заказа: от 1 до 720 часов")
+            ttl = st.get("order_ttl_hours", 24)
+        new["order_ttl_hours"] = ttl
         st.update(new)
         if not errors:
             S.save_catalog(data)
-            flash("✅ Настройки сохранены")
+            flash("✅ Настройки сохранены, бот уже работает с ними")
             return redirect(url_for("settings_page"))
-    env = {
-        "card": bool(S.PROVIDER_TOKEN),
-        "crypto": bool(S.CRYPTO_PAY_TOKEN),
-        "testnet": S.CRYPTO_TESTNET,
-        "channel": bool(S.PRIVATE_CHANNEL_ID),
-        "admin_id": bool(S.ADMIN_ID),
+    conn = {"boomkassa": BK.configured(), "card": bool(S.cfg("provider_token")),
+            "crypto": bool(S.cfg("crypto_pay_token"))}
+    return render_template("settings.html", active="settings", st=st, errors=errors, conn=conn,
+                           buttons=BUTTON_FIELDS)
+
+
+# ═══════════════════════════ ПОДКЛЮЧЕНИЯ (ТОКЕНЫ) ═══════════════════════════
+
+SECRET_FIELDS = ["bot_token", "provider_token", "crypto_pay_token", "bk_api_key", "bk_webhook_secret"]
+PLAIN_FIELDS = ["admin_ids", "private_channel_id", "currency", "crypto_asset", "bk_base_url", "public_url"]
+
+
+def check_bot_token(token: str) -> tuple:
+    import requests
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15).json()
+    except Exception as e:  # noqa: BLE001
+        return False, f"нет связи с Telegram: {e}"
+    if r.get("ok"):
+        return True, "@" + r["result"]["username"]
+    return False, r.get("description") or "Telegram не принял токен"
+
+
+@app.route("/integrations", methods=["GET", "POST"])
+def integrations():
+    errors = []
+    if request.method == "POST":
+        f = request.form
+        updates = {}
+        for key in SECRET_FIELDS:
+            value = (f.get(key) or "").strip()
+            if f.get(f"clear_{key}") == "on":
+                updates[key] = ""
+            elif value:
+                updates[key] = value
+        for key in PLAIN_FIELDS:
+            updates[key] = (f.get(key) or "").strip()
+        updates["crypto_testnet"] = "1" if f.get("crypto_testnet") == "on" else "0"
+        updates["public_url"] = updates["public_url"].rstrip("/")
+        updates["currency"] = (updates["currency"] or "RUB").upper()
+        updates["crypto_asset"] = (updates["crypto_asset"] or "USDT").upper()
+        updates["bk_base_url"] = (updates["bk_base_url"] or "https://boomkassa.ru").rstrip("/")
+
+        token = updates.get("bot_token")
+        if token and not re.fullmatch(r"\d{5,15}:[A-Za-z0-9_-]{30,50}", token):
+            errors.append("Токен бота выглядит неправильно. Он такой: 123456789:AAH…  (из @BotFather)")
+        bad_ids = [p for p in re.split(r"[\s,;]+", updates["admin_ids"]) if p and not p.lstrip("-").isdigit()]
+        if bad_ids:
+            errors.append("Telegram ID — только цифры (узнать свой: @userinfobot). Несколько — через запятую")
+        if updates["public_url"] and not updates["public_url"].startswith(("http://", "https://")):
+            errors.append("Адрес админки должен начинаться с https://")
+        if not re.fullmatch(r"[A-Z]{3}", updates["currency"]):
+            errors.append("Валюта: три буквы, например RUB")
+        if not errors:
+            token_changed = token and token != S.bot_token()
+            S.save_config(updates)
+            if token_changed:
+                ok, info = check_bot_token(token)
+                flash(f"✅ Токен принят Telegram: {info}. Бот перезапускается, обнови страницу через 5 секунд"
+                      if ok else f"⚠️ Токен сохранён, но Telegram ответил: {info}", None if ok else "error")
+                restart_process()
+            else:
+                flash("✅ Подключения сохранены и уже действуют")
+            return redirect(url_for("integrations"))
+    current = {k: S.cfg(k) for k in SECRET_FIELDS + PLAIN_FIELDS + ["crypto_testnet"]}
+    bk_info = BK.tariffs_info() if BK.configured() else None
+    return render_template("integrations.html", active="integrations", c=current, errors=errors,
+                           bk_info=bk_info, bk_error=BK.last_error(), webhook_url=BK.webhook_url(),
+                           bot=bot_state())
+
+
+@app.post("/integrations/test/<what>")
+def integrations_test(what: str):
+    if what == "telegram":
+        token = S.bot_token()
+        if not token:
+            flash("Токен бота не задан", "error")
+        else:
+            ok, info = check_bot_token(token)
+            flash(f"✅ Бот на связи: {info}" if ok else f"❌ {info}", None if ok else "error")
+    elif what == "admins":
+        ids = S.admin_ids()
+        if not ids:
+            flash("Telegram ID админов не заданы", "error")
+        for admin_id in ids:
+            ok, err = tg_send(admin_id, "✅ Проверка из админки: уведомления о заказах будут приходить сюда.")
+            flash(f"✅ Сообщение для {admin_id} отправлено" if ok
+                  else f"❌ {admin_id}: {err}. Напиши боту /start с этого аккаунта и попробуй снова", None if ok else "error")
+    elif what == "boomkassa":
+        try:
+            info = BK.fetch_tariffs()
+            n = len(info["tariffs"])
+            if n:
+                flash(f"✅ BoomKassa на связи, проект «{info['project'].get('name', '')}», тарифов: {n}")
+            else:
+                flash("⚠️ Ключ рабочий, но для проекта ещё нет тарифов. Их заводит поддержка BoomKassa "
+                      f"{('(' + info['hint'] + ')') if info.get('hint') else ''}", "error")
+        except BK.BKError as e:
+            flash(f"❌ BoomKassa: {e.human()}", "error")
+    elif what == "webhook":
+        secret = S.cfg("bk_webhook_secret")
+        if not secret:
+            flash("Сначала укажи секрет вебхука BoomKassa", "error")
+        else:
+            body = json.dumps({"event": "test.ping", "order_id": "tg-0", "amount": 0}).encode()
+            with app.test_client() as c:
+                r = c.post("/webhook/boomkassa", data=body, content_type="application/json",
+                           headers={"X-Payments-Boom-Signature": BK.sign(body),
+                                    "X-Payments-Boom-Event-Id": "test-" + secrets.token_hex(6)})
+            flash("✅ Вебхук принимает подписанные запросы" if r.status_code == 200
+                  else f"❌ Вебхук ответил {r.status_code}", None if r.status_code == 200 else "error")
+    elif what == "crypto":
+        import requests
+        try:
+            r = requests.post(f"{S.crypto_api()}/getMe", timeout=15,
+                              headers={"Crypto-Pay-API-Token": S.cfg("crypto_pay_token")}).json()
+            flash(f"✅ CryptoBot на связи: {r['result'].get('name')}" if r.get("ok")
+                  else f"❌ CryptoBot: {r.get('error')}", None if r.get("ok") else "error")
+        except Exception as e:  # noqa: BLE001
+            flash(f"❌ CryptoBot недоступен: {e}", "error")
+    else:
+        abort(404)
+    return redirect(url_for("integrations") + f"#{'telegram' if what in ('telegram', 'admins') else what}")
+
+
+# ═══════════════════════════ ВЕБХУК BOOMKASSA ═══════════════════════════
+
+@app.post("/webhook/boomkassa")
+def boomkassa_webhook():
+    raw = request.get_data(cache=False)
+    if not BK.verify_signature(raw, request.headers.get("X-Payments-Boom-Signature", "")):
+        log.warning("BoomKassa: вебхук с неверной подписью от %s", request.remote_addr)
+        return jsonify(error="bad signature"), 401
+    try:
+        ev = json.loads(raw)
+    except ValueError:
+        return jsonify(error="bad json"), 400
+    event = ev.get("event", "")
+    event_id = request.headers.get("X-Payments-Boom-Event-Id") or f"{event}:{ev.get('transaction_id')}"
+    if S.event_seen(event_id):
+        return jsonify(ok=True, duplicate=True)
+    log.info("BoomKassa: %s по %s на %s", event, ev.get("order_id"), ev.get("amount"))
+
+    order_id = BK.parse_order_id(ev.get("order_id"))
+    order = S.get_order(order_id) if order_id else None
+    if event == "test.ping":
+        pass
+    elif event == "payment.succeeded":
+        if not order:
+            alert_admins(f"⚠️ <b>BoomKassa</b>: оплата {escape(str(ev.get('amount')))} ₽ без заказа в боте "
+                         f"(order_id <code>{escape(str(ev.get('order_id')))}</code>). Проверь в кабинете BoomKassa.")
+        else:
+            paid = float(ev.get("amount") or 0)
+            if paid + 0.01 < order["price"]:
+                S.set_order_fields(order_id, note=f"BoomKassa: оплачено {paid} вместо {order['price']}")
+                alert_admins(f"⚠️ <b>BoomKassa</b>: по заказу #{order_id} пришло {paid} ₽ вместо {order['price']} ₽. "
+                             f"Заказ не закрыт, проверь вручную.")
+            else:
+                complete_paid(order_id, f"boomkassa:{ev.get('transaction_id')}")
+    elif event == "payment.refunded":
+        if order:
+            S.set_order_fields(order_id, status="refunded",
+                               note=((order["note"] or "") + f"\nBoomKassa: возврат {ev.get('amount')} ₽").strip())
+        alert_admins(f"↩️ <b>BoomKassa</b>: возврат {escape(str(ev.get('amount')))} ₽ по заказу "
+                     f"#{order_id if order else escape(str(ev.get('order_id')))}")
+    else:
+        log.info("BoomKassa: неизвестное событие %s", event)
+    S.remember_event("boomkassa", event_id, raw.decode("utf-8", "replace"))
+    return jsonify(ok=True)
+
+
+# ═══════════════════════════ СИСТЕМА ═══════════════════════════
+
+def restart_process(delay: float = 1.5) -> None:
+    """Перезапуск всего процесса (бот + админка) — подхватывает новый токен бота."""
+    def _do():
+        log.info("Перезапуск по команде из админки")
+        logging.shutdown()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Timer(delay, _do).start()
+
+
+def tail_log(lines: int = 400, level: str = "") -> list:
+    if not S.LOG_PATH.exists():
+        return []
+    with open(S.LOG_PATH, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 300_000))
+        data = f.read().decode("utf-8", "replace").splitlines()
+    if level:
+        data = [x for x in data if f" {level} " in x]
+    return data[-lines:]
+
+
+@app.get("/system")
+def system():
+    level = request.args.get("level", "")
+    if level not in ("", "WARNING", "ERROR"):
+        level = ""
+    db_size = sum(p.stat().st_size for p in S.DATA_DIR.glob("orders.db*"))
+    info = {
+        "python": sys.version.split()[0], "data_dir": str(S.DATA_DIR), "db_size": db_size,
+        "orders": S.db_one("SELECT COUNT(*) c FROM orders")["c"], "users": S.db_one("SELECT COUNT(*) c FROM users")["c"],
+        "has_backup": S.BACKUP_PATH.exists(),
+        "backup_time": datetime.fromtimestamp(S.BACKUP_PATH.stat().st_mtime).strftime("%d.%m %H:%M")
+        if S.BACKUP_PATH.exists() else "", "pw_custom": bool(S.cfg("admin_password_hash")),
     }
-    return render_template("settings.html", active="settings", st=st, errors=errors, env=env)
+    return render_template("system.html", active="system", info=info, logs=tail_log(level=level), level=level,
+                           bot=bot_state())
 
 
-# ═══════════════════════════ HTML-ШАБЛОНЫ ═══════════════════════════
+@app.post("/system/password")
+def change_password():
+    cur, new, rep = (request.form.get(k, "") for k in ("current", "new", "repeat"))
+    if not check_password(cur):
+        flash("Текущий пароль указан неверно", "error")
+    elif len(new) < 10:
+        flash("Новый пароль: минимум 10 символов", "error")
+    elif new != rep:
+        flash("Пароли не совпадают", "error")
+    else:
+        S.save_config({"admin_password_hash": generate_password_hash(new)})
+        session["pw"] = password_stamp()
+        log.info("Пароль админки изменён")
+        flash("🔐 Пароль изменён. На других устройствах нужно будет войти заново")
+    return redirect(url_for("system"))
 
-TEMPLATES = {}
 
-TEMPLATES["base.html"] = r"""<!doctype html>
-<html lang="ru"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}Админка{% endblock %} · {{ shop_name }}</title>
-<style>
-:root{--bg:#0d1016;--panel:#151a24;--panel2:#1c2330;--line:#283142;--text:#e9edf5;--mute:#8a94a7;
---acc:#7b61ff;--acc2:#3aa8ff;--ok:#31c97a;--warn:#f0b04a;--bad:#ff5d6e;--r:14px}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-a{color:var(--acc2);text-decoration:none}
-.top{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;padding:10px 18px;
-background:rgba(13,16,22,.9);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
-.brand{font-weight:800;white-space:nowrap;letter-spacing:.2px}
-.brand small{display:block;color:var(--mute);font-weight:500;font-size:11.5px;letter-spacing:.4px;text-transform:uppercase}
-nav{display:flex;gap:4px;overflow-x:auto;flex:1;scrollbar-width:none}
-nav::-webkit-scrollbar{display:none}
-nav a{color:var(--mute);padding:8px 12px;border-radius:10px;white-space:nowrap;font-weight:500}
-nav a.on{background:var(--panel2);color:var(--text)}nav a:hover{color:var(--text)}
-.pill{display:inline-block;background:var(--bad);color:#fff;border-radius:999px;padding:0 7px;font-size:12px;margin-left:5px;line-height:18px}
-main{max-width:1180px;margin:0 auto;padding:22px 18px 70px}
-h1{font-size:24px;margin:2px 0 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-h1 .sp{flex:1}
-h2{font-size:17px;margin:0 0 12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px}
-.grid{display:grid;gap:14px}.stack{display:grid;gap:12px}
-.stats{grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:18px}
-.stat .l{color:var(--mute);font-size:13px}.stat .v{font-size:25px;font-weight:800;margin-top:2px}.stat .s{color:var(--mute);font-size:12.5px}
-.stat.hot{border-color:#5a3a1a;background:linear-gradient(180deg,#2a1e12,#151a24)}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;padding:9px 14px;
-font:inherit;font-weight:650;cursor:pointer;background:var(--acc);color:#fff;white-space:nowrap}
-.btn:hover{filter:brightness(1.1)}
-.btn.sec{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
-.btn.ok{background:var(--ok);color:#05140b}.btn.bad{background:transparent;color:var(--bad);border:1px solid #5b2a33}
-.btn.sm{padding:6px 10px;font-size:13px;border-radius:9px}
-.ghost{background:none;border:1px solid var(--line);color:var(--mute);border-radius:10px;padding:7px 12px;cursor:pointer;font:inherit}
-form.inline{display:inline}
-label{display:block;font-size:13px;color:var(--mute);margin:14px 0 6px;font-weight:500}
-input[type=text],input[type=number],input[type=password],input[type=search],textarea,select{width:100%;background:var(--bg);
-border:1px solid var(--line);color:var(--text);border-radius:10px;padding:10px 12px;font:inherit}
-textarea{min-height:120px;resize:vertical;font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-input:focus,textarea:focus,select:focus{outline:2px solid var(--acc);border-color:transparent}
-.row{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
-.check{display:flex;align-items:center;gap:10px;margin:14px 0 0;color:var(--text);font-size:15px;font-weight:500;cursor:pointer}
-.check input{width:20px;height:20px;accent-color:var(--acc)}
-.hint{color:var(--mute);font-size:12.5px;margin-top:6px}
-.flash{padding:12px 14px;border-radius:12px;margin-bottom:14px;background:#12301f;border:1px solid #22573a}
-.flash.error,.errbox{background:#35161d;border:1px solid #6b2a36;padding:12px 14px;border-radius:12px;margin-bottom:14px}
-.errbox ul{margin:6px 0 0 18px;padding:0}
-.split{display:grid;gap:20px;grid-template-columns:minmax(0,1fr) 370px;align-items:start}
-@media(max-width:920px){.split{grid-template-columns:1fr}.sticky{position:static!important}}
-.sticky{position:sticky;top:78px}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
-.muted{color:var(--mute)}.small{font-size:13px}
-/* превью Telegram */
-.phone{background:#0a0d13;border:1px solid var(--line);border-radius:22px;overflow:hidden}
-.phone-head{padding:10px 14px;font-size:12.5px;color:var(--mute);border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:8px}
-.chat{padding:14px;min-height:160px;background:radial-gradient(circle at 15% 0%,#1d2547 0,transparent 55%),radial-gradient(circle at 100% 100%,#2a1d40 0,transparent 50%),#0f131d}
-.bubble{background:#202939;border-radius:16px 16px 16px 5px;padding:10px 12px;font-size:14.5px;line-height:1.42;overflow-wrap:anywhere}
-.bubble a{color:#6cb9ff}.bubble code{background:#0004;padding:1px 4px;border-radius:5px;font-size:13px}
-.bubble s{opacity:.7}.bubble blockquote{border-left:3px solid var(--acc2);margin:4px 0;padding-left:8px}
-.btns{display:grid;gap:4px;margin-top:4px}.btns .r{display:grid;gap:4px;grid-auto-flow:column;grid-auto-columns:1fr}
-.btns span{background:#2a3446d9;border-radius:10px;text-align:center;padding:8px 6px;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.errs{color:var(--bad);font-size:13px;margin-top:10px}
-/* списки */
-.item{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.item.off{opacity:.55}
-.em{font-size:24px;width:46px;height:46px;flex:none;display:grid;place-items:center;background:var(--panel2);border-radius:12px}
-.info{flex:1;min-width:170px}.nm{font-weight:700}.sub{color:var(--mute);font-size:13px}
-.acts{display:flex;gap:6px;flex-wrap:wrap}
-.badge{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--panel2);color:var(--mute);border:1px solid var(--line);white-space:nowrap}
-.badge.ok{color:var(--ok);border-color:#22573a}.badge.warn{color:var(--warn);border-color:#5a4520}.badge.bad{color:var(--bad);border-color:#5b2a33}
-/* заказы */
-.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
-.tabs a{padding:7px 13px;border-radius:999px;background:var(--panel);border:1px solid var(--line);color:var(--mute);font-size:14px}
-.tabs a.on{color:var(--text);border-color:var(--acc);background:#1d1a33}
-.order .h{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
-.order .meta{display:flex;gap:6px 16px;flex-wrap:wrap;color:var(--mute);font-size:13.5px;margin:8px 0 4px}
-.order .meta b{color:var(--text);font-weight:600}
-.nick{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--bg);border:1px solid var(--line);padding:1px 7px;border-radius:7px;color:var(--text)}
-details{margin-top:8px}details summary{cursor:pointer;color:var(--acc2);font-size:14px;list-style:none}
-details summary::-webkit-details-marker{display:none}
-details textarea{min-height:80px;margin-top:8px}
-.radios{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:14px}.radios label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text)}
-.toolbar{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}
-.toolbar button{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:3px 10px;cursor:pointer;font:inherit;font-size:13px}
-.search{display:flex;gap:8px;margin-bottom:14px}.search input{max-width:360px}
-table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--mute);font-weight:500}
-.login{max-width:380px;margin:12vh auto}
-.status{display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}.status:last-child{border:0}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);flex:none}.dot.ok{background:var(--ok)}
-.empty{color:var(--mute);text-align:center;padding:28px}
-@media(max-width:760px){.top{flex-wrap:wrap;gap:8px;padding:10px 12px}.top .brand{flex:1}.top nav{order:3;flex-basis:100%;margin:0 -4px}main{padding:16px 12px 70px}h1{font-size:21px}}
-</style></head>
-<body>
-{% if session.get('ok') %}
-<header class="top">
-  <div class="brand">💎 {{ shop_name }}<small>админка</small></div>
-  <nav>
-    <a href="/" class="{{ 'on' if active == 'dash' }}">📊 Сводка</a>
-    <a href="/orders" class="{{ 'on' if active == 'orders' }}">🧾 Заказы{% if todo_count %}<span class="pill">{{ todo_count }}</span>{% endif %}</a>
-    <a href="/items/sub" class="{{ 'on' if active == 'sub' }}">💎 Подписки</a>
-    <a href="/items/svc" class="{{ 'on' if active == 'svc' }}">🛍 Услуги</a>
-    <a href="/texts" class="{{ 'on' if active == 'texts' }}">✍️ Тексты</a>
-    <a href="/settings" class="{{ 'on' if active == 'settings' }}">⚙️ Настройки</a>
-  </nav>
-  <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="ghost">Выйти</button></form>
-</header>
-{% endif %}
-<main>
-{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
-{% block content %}{% endblock %}
-</main>
-<script>
-function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
-function renderButtons(el,rows){el.innerHTML=(rows||[]).map(r=>'<div class="r">'+r.map(t=>'<span>'+esc(t)+'</span>').join('')+'</div>').join('')}
-document.addEventListener('click',e=>{const b=e.target.closest('[data-wrap]');if(!b)return;e.preventDefault();
-  const ta=document.getElementById(b.dataset.for),[o,c]=b.dataset.wrap.split('|'),s=ta.selectionStart,en=ta.selectionEnd;
-  ta.setRangeText(o+ta.value.slice(s,en)+c,s,en,'end');ta.focus();ta.dispatchEvent(new Event('input',{bubbles:true}))});
-document.addEventListener('submit',e=>{const m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault()});
-</script>
-{% block scripts %}{% endblock %}
-</body></html>"""
+@app.post("/system/restart")
+def system_restart():
+    restart_process()
+    flash("🔄 Бот перезапускается, это займёт несколько секунд")
+    return redirect(url_for("system"))
 
-TEMPLATES["macros.html"] = r"""
-{% macro phone(id, html='', buttons=[], head='Так увидит покупатель') %}
-<div class="phone"><div class="phone-head"><span>📱 {{ head }}</span><span>бот</span></div>
-<div class="chat"><div class="bubble" id="{{ id }}">{{ html|tg }}</div>
-<div class="btns" id="{{ id }}-btns">{% for r in buttons %}<div class="r">{% for b in r %}<span>{{ b }}</span>{% endfor %}</div>{% endfor %}</div>
-</div></div>
-{% endmacro %}
-{% macro toolbar(id) %}
-<div class="toolbar">
-<button type="button" data-for="{{ id }}" data-wrap="<b>|</b>"><b>Ж</b></button>
-<button type="button" data-for="{{ id }}" data-wrap="<i>|</i>"><i>К</i></button>
-<button type="button" data-for="{{ id }}" data-wrap="<u>|</u>"><u>Ч</u></button>
-<button type="button" data-for="{{ id }}" data-wrap="<s>|</s>"><s>З</s></button>
-<button type="button" data-for="{{ id }}" data-wrap="<code>|</code>">код</button>
-<button type="button" data-for="{{ id }}" data-wrap="<tg-spoiler>|</tg-spoiler>">спойлер</button>
-</div>
-{% endmacro %}
-{% macro csrf() %}<input type="hidden" name="csrf" value="{{ csrf_token() }}">{% endmacro %}
-"""
 
-TEMPLATES["login.html"] = r"""{% extends "base.html" %}{% block title %}Вход{% endblock %}
-{% block content %}
-<div class="login card">
-  <h1>💎 Вход в админку</h1>
-  {% if error %}<div class="errbox">{{ error }}</div>{% endif %}
-  <form method="post">
-    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
-    <label>Пароль</label>
-    <input type="password" name="password" autofocus autocomplete="current-password">
-    <div class="actions"><button class="btn" style="width:100%">Войти</button></div>
-  </form>
-</div>
-{% endblock %}"""
+@app.post("/system/restore-catalog")
+def restore_catalog():
+    if not S.BACKUP_PATH.exists():
+        flash("Резервной копии каталога нет", "error")
+    else:
+        try:
+            data = json.loads(S.BACKUP_PATH.read_text(encoding="utf-8"))
+        except ValueError:
+            flash("Резервная копия повреждена", "error")
+            return redirect(url_for("system"))
+        S.save_catalog(data)  # текущая версия уходит в backup — можно вернуть обратно той же кнопкой
+        flash("↩️ Каталог возвращён к версии до последнего сохранения")
+    return redirect(url_for("system"))
 
-TEMPLATES["order_card.html"] = r"""{% from "macros.html" import csrf %}
-<div class="card order">
-  <div class="h">
-    <div><b>#{{ o.id }}</b> · {{ o.title }}</div>
-    <span class="badge {{ 'ok' if o.status == 'done' else 'warn' if o.status in ('paid','waiting') else 'bad' }}">{{ STATUS[o.status] }}</span>
-  </div>
-  <div class="meta">
-    <span>💰 <b>{{ order_paid(o) }}</b></span>
-    <span>👤 <a href="tg://user?id={{ o.user_id }}">{{ o.username or o.user_id }}</a></span>
-    {% if o.nick %}<span>🎮 <span class="nick">{{ o.nick }}</span></span>{% elif o.status == 'paid' %}<span>🎮 ждём ник</span>{% endif %}
-    <span>🕓 {{ (o.paid_at or o.created_at)|dt }}</span>
-  </div>
-  {% if o.status in ('paid', 'waiting', 'done') %}
-  <div class="acts" style="margin-top:6px">
-    {% if o.status != 'done' %}
-    <form method="post" action="/orders/{{ o.id }}/done" class="inline">{{ csrf() }}<input type="hidden" name="back" value="{{ back }}">
-      <button class="btn ok sm">✅ Выдано</button></form>
-    {% endif %}
-  </div>
-  <details>
-    <summary>📩 Отправить код или сообщение покупателю</summary>
-    <form method="post" action="/orders/{{ o.id }}/send">{{ csrf() }}<input type="hidden" name="back" value="{{ back }}">
-      <textarea name="text" placeholder="Например: код подарочной карты или ссылка на группу"></textarea>
-      <div class="radios">
-        <label><input type="radio" name="as" value="code" checked> как код</label>
-        <label><input type="radio" name="as" value="text"> обычным текстом</label>
-        <label><input type="checkbox" name="close" {{ 'checked' if o.status != 'done' }}> закрыть заказ</label>
-      </div>
-      <div class="actions" style="margin-top:10px"><button class="btn sm">Отправить</button></div>
-    </form>
-  </details>
-  {% endif %}
-</div>"""
 
-TEMPLATES["dashboard.html"] = r"""{% extends "base.html" %}{% block title %}Сводка{% endblock %}
-{% block content %}
-<h1>📊 Сводка</h1>
-<div class="grid stats">
-  <div class="card stat {{ 'hot' if todo }}"><div class="l">Ждут выдачи</div><div class="v">{{ todo|length }}</div><div class="s"><a href="/orders">открыть заказы →</a></div></div>
-  <div class="card stat"><div class="l">Сегодня</div><div class="v">{{ today.rub|money }}</div><div class="s">{{ today.n }} заказ(ов){% if today.stars %} · {{ today.stars }} ⭐{% endif %}</div></div>
-  <div class="card stat"><div class="l">7 дней</div><div class="v">{{ week.rub|money }}</div><div class="s">{{ week.n }} заказ(ов){% if week.stars %} · {{ week.stars }} ⭐{% endif %}</div></div>
-  <div class="card stat"><div class="l">30 дней</div><div class="v">{{ month.rub|money }}</div><div class="s">{{ month.n }} заказ(ов) · покупателей всего: {{ buyers }}</div></div>
-</div>
-<div class="split">
-  <div class="stack">
-    <h2>⏳ Нужно выдать</h2>
-    {% for o in todo %}{% set back = '/' %}{% include "order_card.html" %}{% else %}<div class="card empty">🎉 Всё выдано, новых заказов нет</div>{% endfor %}
-  </div>
-  <div class="stack">
-    <div class="card"><h2>💳 Способы оплаты · 30 дней</h2>
-      {% set names = {'XTR': '⭐ Stars', 'RUB': '💳 Рубли', 'USDT': '💵 USDT'} %}
-      {% if by_method %}<table>{% for m in by_method %}<tr><td>{{ names.get(m.currency, m.currency) }}</td><td>{{ m.n }} шт.</td><td style="text-align:right">{{ m.rub|money }}</td></tr>{% endfor %}</table>
-      {% else %}<div class="muted small">Пока нет оплат</div>{% endif %}
-    </div>
-    <div class="card"><h2>🏆 Топ позиций · 30 дней</h2>
-      {% if top %}<table>{% for t in top %}<tr><td>{{ t.title }}</td><td>{{ t.n }}</td><td style="text-align:right">{{ t.rub|money }}</td></tr>{% endfor %}</table>
-      {% else %}<div class="muted small">Пока нет продаж</div>{% endif %}
-    </div>
-    <div class="muted small">Суммы в рублях по цене заказа; для Stars дополнительно показано число звёзд.</div>
-  </div>
-</div>
-{% endblock %}"""
+@app.get("/system/backup.zip")
+def backup_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        tmp = S.DATA_DIR / ".backup.db"
+        with S.DB_LOCK:
+            dst = sqlite3.connect(tmp)
+            S.DB.backup(dst)
+            dst.close()
+        z.write(tmp, "orders.db")
+        tmp.unlink(missing_ok=True)
+        for name in ("catalog.json", "catalog.backup.json", "boomkassa_tariffs.json"):
+            p = S.DATA_DIR / name
+            if p.exists():
+                z.write(p, name)
+        if request.args.get("secrets") == "1" and S.CONFIG_PATH.exists():
+            z.write(S.CONFIG_PATH, "config.json")
+    buf.seek(0)
+    name = f"robux_backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.zip"
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=name)
 
-TEMPLATES["orders.html"] = r"""{% extends "base.html" %}{% block title %}Заказы{% endblock %}
-{% block content %}
-<h1>🧾 Заказы</h1>
-<div class="tabs">{% for k, v in filters.items() %}<a href="?f={{ k }}" class="{{ 'on' if f == k }}">{{ v[0] }}</a>{% endfor %}</div>
-<form class="search" method="get"><input type="hidden" name="f" value="{{ f }}">
-  <input type="search" name="q" value="{{ q }}" placeholder="№ заказа, ник Roblox, ник или ID в Telegram">
-  <button class="btn sec">Найти</button></form>
-<div class="stack">
-{% set back = request.full_path %}
-{% for o in rows %}{% include "order_card.html" %}{% else %}<div class="card empty">Здесь пусто</div>{% endfor %}
-</div>
-{% endblock %}"""
 
-TEMPLATES["items.html"] = r"""{% extends "base.html" %}{% from "macros.html" import phone, csrf %}
-{% block title %}{{ title }}{% endblock %}
-{% block content %}
-<h1>{{ '💎' if kind == 'sub' else '🛍' }} {{ title }}<span class="sp"></span><a class="btn" href="/items/{{ kind }}/new">＋ Добавить</a></h1>
-<div class="split">
-  <div class="stack">
-  {% for it in lst %}
-    <div class="card item {{ '' if it.get('active', True) else 'off' }}">
-      <div class="em">{{ it.emoji }}</div>
-      <div class="info">
-        <div class="nm">{{ it.name }} {% if kind == 'sub' %}• {{ it.period }}{% else %}— {{ it.amount }}{% endif %}</div>
-        <div class="sub">{{ it.price|money }}{% if kind == 'sub' and it.discount %} · скидка {{ it.discount }}%{% if it.days %} на {{ it.days }} дн.{% endif %}{% endif %}
-          · {% if it.get('active', True) %}<span class="badge ok">в боте</span>{% else %}<span class="badge warn">скрыто</span>{% endif %}</div>
-      </div>
-      <div class="acts">
-        <a class="btn sm" href="/items/{{ kind }}/{{ it.key }}">✏️ Изменить</a>
-        <form method="post" action="/items/{{ kind }}/{{ it.key }}/up" class="inline">{{ csrf() }}<button class="btn sec sm" title="Выше" {{ 'disabled' if loop.first }}>↑</button></form>
-        <form method="post" action="/items/{{ kind }}/{{ it.key }}/down" class="inline">{{ csrf() }}<button class="btn sec sm" title="Ниже" {{ 'disabled' if loop.last }}>↓</button></form>
-        <form method="post" action="/items/{{ kind }}/{{ it.key }}/toggle" class="inline">{{ csrf() }}<button class="btn sec sm">{{ '🙈 Скрыть' if it.get('active', True) else '👁 Показать' }}</button></form>
-        <form method="post" action="/items/{{ kind }}/{{ it.key }}/delete" class="inline" data-confirm="Удалить «{{ it.name }}»? Это нельзя отменить (можно просто скрыть).">{{ csrf() }}<button class="btn bad sm">🗑</button></form>
-      </div>
-    </div>
-  {% else %}<div class="card empty">Пока пусто, нажми «Добавить»</div>{% endfor %}
-  </div>
-  <div class="sticky">{{ phone('pv', screen, buttons, 'Список в боте') }}
-    <div class="hint">Скрытые позиции в боте не показываются. Порядок меняется стрелками ↑ ↓.</div></div>
-</div>
-{% endblock %}"""
-
-TEMPLATES["item_form.html"] = r"""{% extends "base.html" %}{% from "macros.html" import phone, toolbar, csrf %}
-{% block title %}{{ 'Новая позиция' if is_new else item.name }}{% endblock %}
-{% block content %}
-<h1><a href="/items/{{ kind }}" class="muted">← {{ title }}</a> / {{ 'Новая позиция' if is_new else item.name }}</h1>
-{% if errors %}<div class="errbox"><b>Не сохранено, исправь:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
-<div class="split">
-<form method="post" id="itemForm" class="card" data-preview="/preview/item/{{ kind }}">
-  {{ csrf() }}<input type="hidden" name="key" value="{{ '' if is_new else key }}">
-  <div class="row">
-    <div><label>Эмодзи</label><input type="text" name="emoji" value="{{ item.emoji }}" maxlength="8"></div>
-    <div style="grid-column:span 2"><label>Название</label><input type="text" name="name" value="{{ item.name }}" maxlength="40" placeholder="{{ 'VIP' if kind == 'sub' else 'Быстрые робуксы' }}"></div>
-  </div>
-  <div class="row">
-    {% if kind == 'sub' %}
-    <div><label>Период</label><input type="text" name="period" value="{{ item.period }}" placeholder="Навсегда / 1 месяц"></div>
-    {% else %}
-    <div><label>Что получает покупатель</label><input type="text" name="amount" value="{{ item.amount }}" placeholder="500 R$"></div>
-    {% endif %}
-    <div><label>Цена, {{ currency_sign }}</label><input type="number" name="price" value="{{ item.price }}" min="1" inputmode="numeric"></div>
-  </div>
-  {% if kind == 'sub' %}
-  <div class="row">
-    <div><label>Скидка на все услуги, %</label><input type="number" name="discount" value="{{ item.discount or 0 }}" min="0" max="90" inputmode="numeric"></div>
-    <div><label>Срок скидки, дней</label><input type="number" name="days" value="{{ item.days or '' }}" min="1" placeholder="пусто = навсегда" inputmode="numeric"></div>
-  </div>
-  <div class="hint">Бот сам считает скидку подписчику и показывает в услугах зачёркнутую старую цену.</div>
-  {% endif %}
-
-  <label>Короткое описание для счёта (до 200 символов, без разметки)</label>
-  <input type="text" name="short" value="{{ item.short }}" maxlength="200">
-
-  {% if kind == 'sub' %}
-  <label>Описание тарифа (курсивом под заголовком)</label>
-  {{ toolbar('f_about') }}<textarea id="f_about" name="about" style="min-height:70px">{{ item.about }}</textarea>
-  <label>Что входит в подписку: каждый пункт с новой строки</label>
-  {{ toolbar('f_includes') }}<textarea id="f_includes" name="includes" style="min-height:140px">{{ item.includes|join('\n') }}</textarea>
-  <label>Срок</label>
-  <input type="text" name="term" value="{{ item.term }}" placeholder="навсегда, без продлений">
-  <label>Как получить</label>
-  {{ toolbar('f_how') }}<textarea id="f_how" name="how" style="min-height:80px">{{ item.how }}</textarea>
-  {% else %}
-  <label>Описание услуги</label>
-  {{ toolbar('f_text') }}<textarea id="f_text" name="text" style="min-height:170px">{{ item.text }}</textarea>
-  {% endif %}
-
-  <label class="check"><input type="checkbox" name="needs_nick" {{ 'checked' if item.needs_nick }}> Спрашивать ник в Roblox после оплаты</label>
-  {% if kind == 'svc' %}
-  <label>Свой текст вопроса про ник (необязательно)</label>
-  <input type="text" name="nick_prompt" value="{{ item.nick_prompt or '' }}" placeholder="По умолчанию: текст из раздела «Тексты»">
-  {% endif %}
-  <label class="check"><input type="checkbox" name="active" {{ 'checked' if item.get('active', True) }}> Показывать в боте</label>
-
-  <div class="hint" style="margin-top:14px">Разметка Telegram: &lt;b&gt;жирный&lt;/b&gt;, &lt;i&gt;курсив&lt;/i&gt;, &lt;s&gt;зачёркнутый&lt;/s&gt;, &lt;code&gt;код&lt;/code&gt;. Выдели текст и нажми кнопку над полем.</div>
-  <div class="actions">
-    <button class="btn">💾 Сохранить</button>
-    <a class="btn sec" href="/items/{{ kind }}">Отмена</a>
-  </div>
-</form>
-<div class="sticky">{{ phone('pv') }}<div class="errs" id="pv-errs"></div></div>
-</div>
-{% endblock %}
-{% block scripts %}<script>
-(()=>{const f=document.getElementById('itemForm');
-const upd=debounce(async()=>{try{const r=await fetch(f.dataset.preview,{method:'POST',body:new FormData(f)});const j=await r.json();
-document.getElementById('pv').innerHTML=j.html;renderButtons(document.getElementById('pv-btns'),j.buttons);
-document.getElementById('pv-errs').innerHTML=(j.errors||[]).map(x=>'• '+x).join('<br>');}catch(e){}},250);
-f.addEventListener('input',upd);f.addEventListener('change',upd);upd();})();
-</script>{% endblock %}"""
-
-TEMPLATES["texts.html"] = r"""{% extends "base.html" %}{% from "macros.html" import phone, toolbar, csrf %}
-{% block title %}Тексты{% endblock %}
-{% block content %}
-<h1>✍️ Тексты бота</h1>
-{% if errors %}<div class="errbox"><b>Не сохранено: проверь поля, отмеченные красным</b></div>{% endif %}
-<form method="post" id="textsForm" class="stack">{{ csrf() }}
-{% for key, label, hint in fields %}
-  <div class="card split" style="grid-template-columns:minmax(0,1fr) 340px">
-    <div>
-      <h2>{{ label }}</h2>
-      {{ toolbar('t_' ~ key) }}
-      <textarea id="t_{{ key }}" name="{{ key }}" data-field="{{ key }}" style="min-height:190px">{{ tx[key] }}</textarea>
-      <div class="hint">{{ hint }}</div>
-      {% if errors.get(key) %}<div class="errs">{% for e in errors[key] %}• {{ e|safe }}<br>{% endfor %}</div>{% endif %}
-      <div class="errs" id="pv_{{ key }}-errs"></div>
-    </div>
-    <div>{{ phone('pv_' ~ key, screens[key][0], screens[key][1]) }}</div>
-  </div>
-{% endfor %}
-<div class="actions" style="position:sticky;bottom:12px"><button class="btn">💾 Сохранить все тексты</button></div>
-</form>
-{% endblock %}
-{% block scripts %}<script>
-(()=>{const csrf=document.querySelector('#textsForm [name=csrf]').value;
-document.querySelectorAll('textarea[data-field]').forEach(ta=>{const id='pv_'+ta.dataset.field;
-ta.addEventListener('input',debounce(async()=>{const fd=new FormData();fd.append('csrf',csrf);fd.append('field',ta.dataset.field);fd.append('value',ta.value);
-try{const r=await fetch('/preview/text',{method:'POST',body:fd});const j=await r.json();document.getElementById(id).innerHTML=j.html;
-renderButtons(document.getElementById(id+'-btns'),j.buttons);document.getElementById(id+'-errs').innerHTML=(j.errors||[]).map(x=>'• '+x).join('<br>');}catch(e){}},250));});})();
-</script>{% endblock %}"""
-
-TEMPLATES["settings.html"] = r"""{% extends "base.html" %}{% from "macros.html" import csrf %}
-{% block title %}Настройки{% endblock %}
-{% block content %}
-<h1>⚙️ Настройки</h1>
-{% if errors %}<div class="errbox"><b>Не сохранено:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
-<div class="split">
-<form method="post" class="card">{{ csrf() }}
-  <h2>🏪 Магазин</h2>
-  <div class="row">
-    <div><label>Название магазина</label><input type="text" name="shop_name" value="{{ st.shop_name }}" maxlength="40"></div>
-    <div><label>Знак валюты</label><input type="text" name="currency_sign" value="{{ st.currency_sign }}" maxlength="4"></div>
-  </div>
-  <label>Аккаунт техподдержки (без @)</label>
-  <input type="text" name="support_username" value="{{ st.support_username }}">
-  <label>Стикер на /start (file_id)</label>
-  <input type="text" name="welcome_sticker" value="{{ st.welcome_sticker }}" placeholder="пусто: анимированный 👋">
-  <div class="hint">Чтобы узнать file_id, отправь боту стикер со своего админ-аккаунта, он пришлёт ID.</div>
-
-  <h2 style="margin-top:22px">💳 Оплата</h2>
-  <label class="check"><input type="checkbox" name="enable_stars" {{ 'checked' if st.enable_stars }}> ⭐ Telegram Stars</label>
-  <label class="check"><input type="checkbox" name="enable_card" {{ 'checked' if st.enable_card }}> 💳 Рубли (карта)</label>
-  <label class="check"><input type="checkbox" name="enable_crypto" {{ 'checked' if st.enable_crypto }}> 💵 USDT через CryptoBot</label>
-  <label>Курс: сколько рублей стоит 1 ⭐</label>
-  <input type="text" name="rub_per_star" value="{{ st.rub_per_star }}" inputmode="decimal">
-  <div class="hint">Цена в звёздах = цена в рублях ÷ курс, с округлением вверх.</div>
-  <div class="actions"><button class="btn">💾 Сохранить</button></div>
-</form>
-<div class="card">
-  <h2>🔌 Подключения (файл .env)</h2>
-  <div class="status"><span class="dot {{ 'ok' if env.admin_id }}"></span>Уведомления о заказах в Telegram (ADMIN_ID)</div>
-  <div class="status"><span class="dot ok"></span>⭐ Stars работают без токена</div>
-  <div class="status"><span class="dot {{ 'ok' if env.card }}"></span>💳 Платёжка картой (PROVIDER_TOKEN)</div>
-  <div class="status"><span class="dot {{ 'ok' if env.crypto }}"></span>💵 CryptoBot (CRYPTO_PAY_TOKEN){% if env.crypto %} · {{ 'тестовая сеть' if env.testnet else 'боевой режим' }}{% endif %}</div>
-  <div class="status"><span class="dot {{ 'ok' if env.channel }}"></span>🔒 Закрытый канал для подписчиков (PRIVATE_CHANNEL_ID)</div>
-  <div class="hint" style="margin-top:10px">Токены хранятся только в .env на сервере и в админке не показываются. После правки .env перезапусти бота.</div>
-</div>
-</div>
-{% endblock %}"""
-
-app.jinja_loader = DictLoader(TEMPLATES)
+@app.get("/system/log.txt")
+def download_log():
+    return Response("\n".join(tail_log(5000)), mimetype="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=bot.log"})
 
 
 # ═══════════════════════════ ЗАПУСК ═══════════════════════════
 
-def _check_password() -> bool:
-    if len(S.ADMIN_PASSWORD) < 8:
-        log.warning("ADMIN_PASSWORD короче 8 символов, админка не запущена. Задай надёжный пароль в .env")
-        return False
-    return True
+_started = False
 
 
-def start_in_thread(bot_username: str = "") -> None:
-    """Запуск админки фоном вместе с ботом."""
-    global BOT_USERNAME
-    BOT_USERNAME = bot_username
-    if not _check_password():
+def _password_ready() -> bool:
+    if S.cfg("admin_password_hash") or len(S.ADMIN_PASSWORD) >= 8:
+        return True
+    log.warning("ADMIN_PASSWORD короче 8 символов, админка не запущена. Задай надёжный пароль в .env")
+    return False
+
+
+def _make_server():
+    try:
+        from waitress import create_server
+        srv = create_server(app, host=S.ADMIN_HOST, port=S.ADMIN_PORT, threads=8, ident="robux-admin")
+        return srv.run
+    except ImportError:
+        from werkzeug.serving import make_server
+        return make_server(S.ADMIN_HOST, S.ADMIN_PORT, app, threaded=True).serve_forever
+
+
+def start_in_thread() -> None:
+    """Запуск админки фоном вместе с ботом (повторный вызов ничего не делает)."""
+    global _started
+    if _started or not _password_ready():
         return
-    server = make_server(S.ADMIN_HOST, S.ADMIN_PORT, app, threaded=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Админка: http://%s:%s", "localhost" if S.ADMIN_HOST in ("0.0.0.0", "127.0.0.1") else S.ADMIN_HOST,
-             S.ADMIN_PORT)
+    _started = True
+    S.db_exec("UPDATE broadcasts SET status = 'stopped', finished_at = ? WHERE status = 'running'", (S.now_iso(),))
+    try:
+        serve = _make_server()
+    except OSError as e:
+        log.error("Админка не запустилась: порт %s занят или недоступен (%s)", S.ADMIN_PORT, e)
+        return
+    threading.Thread(target=serve, name="admin", daemon=True).start()
+    url = S.cfg("public_url") or f"http://{'localhost' if S.ADMIN_HOST in ('0.0.0.0', '127.0.0.1') else S.ADMIN_HOST}:{S.ADMIN_PORT}"
+    log.info("Админка запущена: %s", url)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    S.setup_logging()
     S.load_catalog()
-    if TG:
-        try:
-            BOT_USERNAME = TG.get_me().username
-        except Exception:  # noqa: BLE001
-            pass
-    if _check_password():
+    if _password_ready():
+        S.db_exec("UPDATE broadcasts SET status = 'stopped' WHERE status = 'running'")
         log.info("Админка: http://localhost:%s", S.ADMIN_PORT)
-        make_server(S.ADMIN_HOST, S.ADMIN_PORT, app, threaded=True).serve_forever()
+        _make_server()()

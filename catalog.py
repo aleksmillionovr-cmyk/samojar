@@ -15,9 +15,21 @@ SETTINGS = {
     "support_username": "your_support",
     "rub_per_star": 1.8,        # сколько ₽ = 1 ⭐
     "enable_stars": True,
-    "enable_card": True,
-    "enable_crypto": True,
+    "enable_boomkassa": True,   # карта / СБП через BoomKassa (нужен API-ключ в «Подключениях»)
+    "enable_card": False,       # карта через платёжку Telegram (PROVIDER_TOKEN)
+    "enable_crypto": True,      # USDT через @CryptoBot
+    "bk_label": "💳 Карта / СБП",
+    "card_label": "💳 Картой в Telegram",
     "welcome_sticker": "",      # file_id стикера на /start
+    "maintenance": False,       # технический перерыв: бот отвечает только админам
+    "order_ttl_hours": 24,      # через сколько часов неоплаченный заказ отменяется
+    "notify_new_users": False,  # присылать админам уведомление о каждом новом пользователе
+    # подписи кнопок нижнего меню
+    "btn_subs": "💎 Подписки",
+    "btn_services": "🛍 Услуги",
+    "btn_orders": "🧾 Мои заказы",
+    "btn_support": "🆘 Поддержка",
+    "btn_menu": "🏠 Меню",
 }
 
 # ─────────────────────────── ТЕКСТЫ ───────────────────────────
@@ -71,6 +83,7 @@ NICK_PROMPT = (
 # discount  — скидка на все УСЛУГИ в % (бот считает её сам)
 # days      — срок действия скидки (None = навсегда)
 # needs_nick — спросить ник после оплаты (для выдачи робуксов/бонуса)
+# bk_tariff — код тарифа BoomKassa (пусто = подобрать тариф с такой же суммой автоматически)
 
 SUBSCRIPTIONS = {
     "vip_month": {
@@ -261,6 +274,38 @@ SERVICES = {
 }
 
 
+PAID = (
+    "✅ <b>Оплата прошла!</b>\n\n"
+    "🧾 Заказ <b>#{order}</b>\n"
+    "📦 {title}\n\n"
+    "Спасибо за покупку 💎"
+)
+
+IN_WORK = "⏳ Заказ <b>#{order}</b> передан в работу, всё пришлём сюда в течение 15 минут."
+
+NICK_SAVED = (
+    "🙌 Принято! Ник: <code>{nick}</code>\n"
+    "⏳ Заказ <b>#{order}</b> в очереди на выдачу, напишем сюда, как только всё будет готово."
+)
+
+DONE = (
+    "🎉 Заказ <b>#{order}</b> выполнен!\n"
+    "📦 {title}\n\n"
+    "Спасибо, что выбрал {shop} 💎"
+)
+
+MY_ORDERS_EMPTY = "🧾 У тебя пока нет заказов.\n\nЗагляни в каталог 👇"
+
+MAINTENANCE = (
+    "🛠 <b>Технический перерыв</b>\n\n"
+    "Магазин скоро вернётся. Загляни чуть позже 🙏\n"
+    "Срочный вопрос: @{support}"
+)
+
+BANNED = "⛔ Доступ к магазину ограничен. Если это ошибка, напиши в поддержку: @{support}"
+
+UNKNOWN = "🤔 Не понял. Выбери раздел в меню 👇"
+
 TEXTS = {
     "welcome": WELCOME,
     "subs_header": SUBS_HEADER,
@@ -268,4 +313,12 @@ TEXTS = {
     "services_footer": SERVICES_FOOTER,
     "support": SUPPORT,
     "nick_prompt": NICK_PROMPT,
+    "paid": PAID,
+    "in_work": IN_WORK,
+    "nick_saved": NICK_SAVED,
+    "done": DONE,
+    "my_orders_empty": MY_ORDERS_EMPTY,
+    "maintenance": MAINTENANCE,
+    "banned": BANNED,
+    "unknown": UNKNOWN,
 }

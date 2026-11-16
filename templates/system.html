@@ -1,0 +1,55 @@
+{% extends "base.html" %}{% from "macros.html" import csrf %}
+{% block title %}Система{% endblock %}
+{% block content %}
+<h1>🛡 Система</h1>
+<div class="split even">
+  <div class="stack">
+    <div class="card">
+      <h2>🔐 Пароль админки</h2>
+      <form method="post" action="/system/password">{{ csrf() }}
+        <label>Текущий пароль</label><input type="password" name="current" autocomplete="current-password" required>
+        <div class="row">
+          <div><label>Новый пароль (от 10 символов)</label><input type="password" name="new" autocomplete="new-password" minlength="10" required></div>
+          <div><label>Ещё раз</label><input type="password" name="repeat" autocomplete="new-password" minlength="10" required></div>
+        </div>
+        <div class="actions"><button class="btn">Сменить пароль</button></div>
+      </form>
+      <div class="hint">После смены пароля на других устройствах нужно будет войти заново. Забыли пароль — на сервере: <code>robux-bot password</code></div>
+    </div>
+    <div class="card">
+      <h2>💾 Резервные копии</h2>
+      <p class="muted small" style="margin-top:0">Заказы, пользователи, каталог и тексты одним архивом.</p>
+      <div class="actions" style="margin-top:0">
+        <a class="btn sec" href="/system/backup.zip">⬇️ Скачать копию</a>
+        <a class="btn sec" href="/system/backup.zip?secrets=1" onclick="return confirm('В архив попадут токены и ключи. Храни его в надёжном месте. Скачать?')">⬇️ Копия с токенами</a>
+      </div>
+      <hr class="hr">
+      <form method="post" action="/system/restore-catalog" data-confirm="Вернуть каталог и тексты к версии до последнего сохранения?">{{ csrf() }}
+        <button class="btn sec" {{ 'disabled' if not info.has_backup }}>↩️ Отменить последнее изменение каталога</button>
+        {% if info.has_backup %}<span class="hint">версия от {{ info.backup_time }}</span>{% endif %}
+      </form>
+    </div>
+  </div>
+  <div class="stack">
+    <div class="card">
+      <h2>🤖 Процесс бота</h2>
+      <div class="status-line"><span class="dot {{ bot.tone }}"></span><span class="grow">{% if bot.username %}@{{ bot.username }}{% else %}Бот{% endif %}</span><span class="badge {{ bot.tone }}">{{ bot.text }}</span></div>
+      <div class="status-line"><span class="grow muted">Запущен</span><span>{{ bot.since|ago }}</span></div>
+      <div class="status-line"><span class="grow muted">Заказов / пользователей</span><span>{{ info.orders }} / {{ info.users }}</span></div>
+      <div class="status-line"><span class="grow muted">База</span><span>{{ (info.db_size / 1024)|round(1) }} КБ</span></div>
+      <div class="status-line"><span class="grow muted">Python</span><span>{{ info.python }}</span></div>
+      <div class="status-line"><span class="grow muted">Данные</span><code class="small">{{ info.data_dir }}</code></div>
+      <form method="post" action="/system/restart" data-confirm="Перезапустить бота? Это займёт несколько секунд.">{{ csrf() }}
+        <div class="actions"><button class="btn sec">🔄 Перезапустить бота</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+<h2 style="margin-top:22px">📜 Журнал<span class="sp"></span></h2>
+<div class="tabs">
+  <a href="?" class="{{ 'on' if not level }}">Всё</a><a href="?level=WARNING" class="{{ 'on' if level == 'WARNING' }}">Предупреждения</a><a href="?level=ERROR" class="{{ 'on' if level == 'ERROR' }}">Ошибки</a>
+  <a href="/system/log.txt" style="margin-left:auto">⬇️ Скачать</a>
+</div>
+<div class="logs" id="logs">{% for line in logs %}<div class="{{ 'ERROR' if ' ERROR ' in line else 'WARNING' if ' WARNING ' in line else '' }}">{{ line }}</div>{% else %}<span class="muted">Пусто</span>{% endfor %}</div>
+{% endblock %}
+{% block scripts %}<script>const l=document.getElementById('logs');l.scrollTop=l.scrollHeight</script>{% endblock %}

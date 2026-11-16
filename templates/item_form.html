@@ -1,0 +1,85 @@
+{% extends "base.html" %}{% from "macros.html" import phone, toolbar, csrf %}
+{% block title %}{{ 'Новая позиция' if is_new else item.name }}{% endblock %}
+{% block content %}
+<h1><a href="/items/{{ kind }}" class="muted">← {{ title }}</a> / {{ 'Новая позиция' if is_new else item.name }}</h1>
+{% if errors %}<div class="errbox"><b>Не сохранено, исправь:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
+<div class="split">
+<form method="post" id="itemForm" class="card" data-dirty data-preview="/preview/item/{{ kind }}">
+  {{ csrf() }}<input type="hidden" name="key" value="{{ '' if is_new else key }}">
+  <div class="row">
+    <div style="max-width:120px"><label>Эмодзи</label><input type="text" name="emoji" value="{{ item.emoji }}" maxlength="8"></div>
+    <div style="grid-column:span 2"><label>Название</label><input type="text" name="name" value="{{ item.name }}" maxlength="40" placeholder="{{ 'VIP' if kind == 'sub' else 'Быстрые робуксы' }}"></div>
+  </div>
+  <div class="row">
+    {% if kind == 'sub' %}
+    <div><label>Период</label><input type="text" name="period" value="{{ item.period }}" placeholder="Навсегда / 1 месяц"></div>
+    {% else %}
+    <div><label>Что получает покупатель</label><input type="text" name="amount" value="{{ item.amount }}" placeholder="500 R$"></div>
+    {% endif %}
+    <div><label>Цена, {{ currency_sign }}</label><input type="number" name="price" value="{{ item.price }}" min="1" inputmode="numeric"></div>
+  </div>
+  {% if kind == 'sub' %}
+  <div class="row">
+    <div><label>Скидка на все услуги, %</label><input type="number" name="discount" value="{{ item.discount or 0 }}" min="0" max="90" inputmode="numeric"></div>
+    <div><label>Срок скидки, дней</label><input type="number" name="days" value="{{ item.days or '' }}" min="1" placeholder="пусто = навсегда" inputmode="numeric"></div>
+  </div>
+  <div class="hint">Бот сам считает скидку подписчику и показывает в услугах зачёркнутую старую цену.</div>
+  {% endif %}
+
+  <label>Короткое описание для счёта (до 200 символов, без разметки)</label>
+  <input type="text" name="short" value="{{ item.short }}" maxlength="200">
+
+  {% if kind == 'sub' %}
+  <label>Описание тарифа (курсивом под заголовком)</label>
+  {{ toolbar('f_about') }}<textarea id="f_about" name="about" style="min-height:70px">{{ item.about }}</textarea>
+  <label>Что входит в подписку: каждый пункт с новой строки</label>
+  {{ toolbar('f_includes') }}<textarea id="f_includes" name="includes" style="min-height:140px">{{ item.includes|join('\n') }}</textarea>
+  <label>Срок</label>
+  <input type="text" name="term" value="{{ item.term }}" placeholder="навсегда, без продлений">
+  <label>Как получить</label>
+  {{ toolbar('f_how') }}<textarea id="f_how" name="how" style="min-height:80px">{{ item.how }}</textarea>
+  {% else %}
+  <label>Описание услуги</label>
+  {{ toolbar('f_text') }}<textarea id="f_text" name="text" style="min-height:170px">{{ item.text }}</textarea>
+  {% endif %}
+
+  <label class="check"><input type="checkbox" name="needs_nick" {{ 'checked' if item.needs_nick }}> Спрашивать ник в Roblox после оплаты</label>
+  {% if kind == 'svc' %}
+  <label>Свой текст вопроса про ник (необязательно)</label>
+  <input type="text" name="nick_prompt" value="{{ item.nick_prompt or '' }}" placeholder="По умолчанию: текст из раздела «Тексты»">
+  {% endif %}
+  <label class="check"><input type="checkbox" name="active" {{ 'checked' if item.get('active', True) }}> Показывать в боте</label>
+
+  {% if bk_on %}
+  <hr class="hr">
+  <h2>💳 Тариф BoomKassa</h2>
+  {% if tariffs %}
+  <select name="bk_tariff">
+    <option value="">Автоматически — тариф с такой же суммой, как цена</option>
+    {% for t in tariffs %}<option value="{{ t.code }}" {{ 'selected' if item.bk_tariff == t.code }}>{{ t.code }} — {{ t.title }} — {{ t.amount|money }}</option>{% endfor %}
+    {% if item.bk_tariff and item.bk_tariff not in tariffs|map(attribute='code')|list %}<option value="{{ item.bk_tariff }}" selected>{{ item.bk_tariff }} (нет в списке BoomKassa)</option>{% endif %}
+  </select>
+  {% else %}
+  <input type="text" name="bk_tariff" value="{{ item.bk_tariff or '' }}" placeholder="код тарифа, например rbx_590">
+  {% endif %}
+  <div class="hint">BoomKassa принимает оплату только по тарифам, которые для тебя заводит их поддержка. Сумму берёт из тарифа. <span id="bk-state"></span></div>
+  {% else %}<input type="hidden" name="bk_tariff" value="{{ item.bk_tariff or '' }}">{% endif %}
+
+  <div class="hint" style="margin-top:14px">Разметка Telegram: &lt;b&gt;жирный&lt;/b&gt;, &lt;i&gt;курсив&lt;/i&gt;, &lt;s&gt;зачёркнутый&lt;/s&gt;, &lt;code&gt;код&lt;/code&gt;. Выдели текст и нажми кнопку над полем.</div>
+  <div class="savebar">
+    <button class="btn">💾 Сохранить</button>
+    <a class="btn sec" href="/items/{{ kind }}">Отмена</a>
+    <span class="hint" id="pv-errs-short"></span>
+  </div>
+</form>
+<div class="sticky">{{ phone('pv') }}<div class="errs" id="pv-errs"></div></div>
+</div>
+{% endblock %}
+{% block scripts %}<script>
+(()=>{const f=document.getElementById('itemForm');
+const upd=debounce(async()=>{try{const r=await fetch(f.dataset.preview,{method:'POST',body:new FormData(f)});const j=await r.json();
+document.getElementById('pv').innerHTML=j.html;renderButtons(document.getElementById('pv-btns'),j.buttons);
+document.getElementById('pv-errs').innerHTML=(j.errors||[]).map(x=>'• '+x).join('<br>');
+const s=document.getElementById('bk-state');if(s&&j.bk)s.innerHTML=j.bk.text?'<span class="badge '+j.bk.tone+'">'+esc(j.bk.text)+'</span>':'';}catch(e){}},250);
+f.addEventListener('input',upd);f.addEventListener('change',upd);upd();})();
+</script>{% endblock %}

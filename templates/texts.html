@@ -1,0 +1,29 @@
+{% extends "base.html" %}{% from "macros.html" import phone, toolbar, csrf %}
+{% block title %}Тексты{% endblock %}
+{% block content %}
+<h1>✍️ Тексты бота</h1>
+<div class="anchor-nav">{% for group, fields in groups %}{% for key, label, hint in fields %}<a href="#t-{{ key }}">{{ label }}</a>{% endfor %}{% endfor %}</div>
+{% if errors %}<div class="errbox"><b>Не сохранено: проверь поля, отмеченные красным</b></div>{% endif %}
+<form method="post" id="textsForm" class="stack" data-dirty>{{ csrf() }}
+{% for group, fields in groups %}
+  <h3>{{ group }}</h3>
+  {% for key, label, hint in fields %}
+  <div class="card split section-title" id="t-{{ key }}" style="grid-template-columns:minmax(0,1fr) 340px">
+    <div>
+      <h2>{{ label }}</h2>
+      {{ toolbar('t_' ~ key) }}
+      <textarea id="t_{{ key }}" name="{{ key }}" data-field="{{ key }}" style="min-height:{{ 190 if key in ('welcome','support') else 120 }}px">{{ tx[key] }}</textarea>
+      {% if hint %}<div class="hint">{{ hint }}</div>{% endif %}
+      {% if errors.get(key) %}<div class="errs">{% for e in errors[key] %}• {{ e|safe }}<br>{% endfor %}</div>{% endif %}
+      <div class="errs" id="pv_{{ key }}-errs"></div>
+    </div>
+    <div>{{ phone('pv_' ~ key, screens[key][0], screens[key][1]) }}</div>
+  </div>
+  {% endfor %}
+{% endfor %}
+<div class="savebar"><button class="btn">💾 Сохранить все тексты</button><span class="hint">Бот начнёт показывать новые тексты сразу после сохранения</span></div>
+</form>
+{% endblock %}
+{% block scripts %}<script>
+document.querySelectorAll('textarea[data-field]').forEach(ta=>livePreview(ta,'/preview/text','pv_'+ta.dataset.field,()=>({field:ta.dataset.field})));
+</script>{% endblock %}

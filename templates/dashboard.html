@@ -1,0 +1,69 @@
+{% extends "base.html" %}{% from "macros.html" import status_badge, csrf %}
+{% block title %}Сводка{% endblock %}
+{% block content %}
+<h1>📊 Сводка<span class="sp"></span>
+  <form method="post" action="/maintenance" class="inline">{{ csrf() }}<button class="btn sm {{ 'ok' if maintenance else 'sec' }}">{{ '✅ Открыть магазин' if maintenance else '🛠 Техперерыв' }}</button></form>
+</h1>
+
+{% if checklist_left %}
+<div class="card" style="margin-bottom:18px;border-color:#4a3c99;background:linear-gradient(180deg,#1b1733,var(--panel) 80%)">
+  <h2>🚀 Осталось настроить: {{ checklist_left }}</h2>
+  <div class="checklist">
+  {% for c in checklist %}<a href="{{ c.url }}" class="{{ 'ok' if c.ok }}"><span class="mark">{{ '✓' if c.ok else loop.index }}</span><span>{{ c.text }}</span>{% if not c.ok %}<span class="muted small" style="margin-left:auto">настроить →</span>{% endif %}</a>{% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="grid stats">
+  <a class="card stat {{ 'hot' if todo }}" href="/orders" style="color:inherit;text-decoration:none"><div class="l">Ждут выдачи <span>⏳</span></div><div class="v">{{ todo|length }}</div><div class="s">открыть заказы →</div></a>
+  <div class="card stat"><div class="l">Сегодня <span>💰</span></div><div class="v">{{ today.rub|money }}</div><div class="s">{{ today.n }} заказ(ов){% if today.stars %} · {{ today.stars }} ⭐{% endif %}</div></div>
+  <div class="card stat"><div class="l">7 дней</div><div class="v">{{ week.rub|money }}</div><div class="s">{{ week.n }} заказ(ов){% if week.stars %} · {{ week.stars }} ⭐{% endif %}</div></div>
+  <div class="card stat"><div class="l">30 дней</div><div class="v">{{ month.rub|money }}</div><div class="s">{{ month.n }} заказ(ов) · всего {{ total.rub|money }}</div></div>
+  <a class="card stat" href="/users" style="color:inherit;text-decoration:none"><div class="l">Пользователи <span>👥</span></div><div class="v">{{ people.total or 0 }}</div><div class="s">+{{ people.today or 0 }} сегодня · покупателей {{ buyers }}</div></a>
+</div>
+
+<div class="split wide">
+  <div class="stack">
+    <div class="card">
+      <h2>📈 Выручка за 14 дней</h2>
+      <div class="chart">
+        {% for d in chart %}<div class="c {{ 'today' if loop.last }}"><div class="bar {{ 'zero' if not d.sum }}" style="height:{{ d.h if d.sum else 2 }}%"><span class="tip">{{ d.wd }} {{ d.label }}: {{ d.sum|money }} · {{ d.n }} шт.</span></div><span class="lbl">{{ d.label }}</span></div>{% endfor %}
+      </div>
+    </div>
+    <h2 style="margin-top:6px">⏳ Нужно выдать</h2>
+    {% if todo %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>№</th><th>Позиция</th><th>Ник</th><th>Оплата</th><th>Когда</th><th></th></tr></thead>
+      <tbody>
+      {% for o in todo %}
+        <tr class="link order-row" data-href="/orders/{{ o.id }}">
+          <td>#{{ o.id }}</td><td>{{ o.title }}</td>
+          <td>{% if o.nick %}<span class="nick">{{ o.nick }}</span>{% else %}<span class="badge warn">ждём ник</span>{% endif %}</td>
+          <td class="nowrap">{{ order_paid(o) }}</td><td class="nowrap muted">{{ o.paid_at|ago }}</td>
+          <td class="right"><form method="post" action="/orders/{{ o.id }}/done" class="inline">{{ csrf() }}<input type="hidden" name="back" value="/"><button class="btn ok xs">✅ Выдано</button></form></td>
+        </tr>
+      {% endfor %}
+      </tbody></table></div>
+    {% else %}<div class="card empty">🎉 Всё выдано, новых заказов нет</div>{% endif %}
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <h2>🤖 Бот</h2>
+      <div class="status-line"><span class="dot {{ bot.tone }}"></span><span class="grow">{% if bot.username %}<a href="https://t.me/{{ bot.username }}" target="_blank" rel="noopener">@{{ bot.username }}</a>{% else %}Бот{% endif %}</span><span class="badge {{ bot.tone }}">{{ bot.text }}</span></div>
+      <div class="status-line"><span class="grow muted">Способы оплаты</span><span class="small">{% for m in methods %}<span class="badge" style="margin-left:4px">{{ {'stars':'⭐ Stars','boomkassa':'💳 BoomKassa','card':'💳 Карта','crypto':'💵 Крипта'}[m] }}</span>{% else %}<span class="badge bad">нет</span>{% endfor %}</span></div>
+      {% if bot.error %}<div class="status-line"><span class="grow small muted">Последняя ошибка {{ bot.error.at|ago }}: <code>{{ bot.error.text[:140] }}</code></span></div>{% endif %}
+    </div>
+    <div class="card"><h2>💳 Способы оплаты · 30 дней</h2>
+      {% if by_method %}<table class="mini">{% for m in by_method %}<tr><td>{{ METHODS.get(m.method, m.method) }}</td><td class="muted">{{ m.n }} шт.</td><td>{{ m.rub|money }}</td></tr>{% endfor %}</table>
+      {% else %}<div class="muted small">Пока нет оплат</div>{% endif %}
+    </div>
+    <div class="card"><h2>🏆 Топ позиций · 30 дней</h2>
+      {% if top %}<table class="mini">{% for t in top %}<tr><td>{{ t.title }}</td><td class="muted">{{ t.n }}</td><td>{{ t.rub|money }}</td></tr>{% endfor %}</table>
+      {% else %}<div class="muted small">Пока нет продаж</div>{% endif %}
+    </div>
+    <div class="muted small">Суммы — по цене заказа в рублях; для Stars дополнительно показано число звёзд.</div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script>setTimeout(()=>{if(!document.hidden)location.reload()},60000)</script>{% endblock %}

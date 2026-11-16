@@ -1,0 +1,50 @@
+{% extends "base.html" %}{% from "macros.html" import csrf, toolbar, phone %}
+{% block title %}Рассылка{% endblock %}
+{% block content %}
+<h1>📣 Рассылка</h1>
+{% if errors %}<div class="errbox"><b>Рассылка не запущена:</b><ul>{% for e in errors %}<li>{{ e|safe }}</li>{% endfor %}</ul></div>{% endif %}
+<div class="split wide">
+  <form method="post" class="card" id="bcForm" data-confirm="Запустить рассылку? Отменить отправленные сообщения будет нельзя.">{{ csrf() }}
+    <label>Кому</label>
+    <select name="audience">{% for k, v in audiences.items() %}<option value="{{ k }}" {{ 'selected' if form.audience == k }}>{{ v[0] }} — {{ counts[k] }}</option>{% endfor %}</select>
+    <div class="hint">Заблокированные и те, кто остановил бота, не получат сообщение. Совет: сначала отправь «Тест: только админам».</div>
+    <label>Текст</label>
+    {{ toolbar('bc_text') }}<textarea id="bc_text" name="text" style="min-height:200px" placeholder="🔥 Скидка 20% на все услуги до воскресенья!">{{ form.text }}</textarea>
+    <div class="errs" id="pv_bc-errs"></div>
+    <div class="row" style="margin-top:4px">
+      <div><label>Кнопка: подпись (необязательно)</label><input type="text" id="bc_btn" name="button_text" value="{{ form.button_text }}" maxlength="40" placeholder="🛍 Открыть каталог"></div>
+      <div><label>Кнопка: ссылка</label><input type="url" name="button_url" value="{{ form.button_url }}" placeholder="https://t.me/твой_бот?start=svc_fast"></div>
+    </div>
+    <div class="actions"><button class="btn">📣 Запустить рассылку</button></div>
+  </form>
+  <div class="sticky">{{ phone('pv_bc', form.text, [[form.button_text]] if form.button_text else []) }}</div>
+</div>
+
+<h2 style="margin-top:24px">История</h2>
+{% if history %}
+<div class="table-wrap"><table>
+  <thead><tr><th>№</th><th>Текст</th><th>Кому</th><th>Прогресс</th><th>Дата</th><th></th></tr></thead>
+  <tbody>
+  {% for b in history %}
+  <tr data-bc="{{ b.id }}" data-status="{{ b.status }}">
+    <td>#{{ b.id }}</td>
+    <td style="max-width:340px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ b.text|striptags }}</div></td>
+    <td class="nowrap">{{ audiences[b.audience][0] if b.audience in audiences else b.audience }}</td>
+    <td style="min-width:170px"><span class="bc-text">{{ b.sent }} из {{ b.total }}{% if b.failed %} · ошибок {{ b.failed }}{% endif %}</span>
+      <div class="progress"><i class="bc-bar" style="width:{{ (100 * (b.sent + b.failed) / b.total)|round|int if b.total else (100 if b.status != 'running' else 0) }}%"></i></div></td>
+    <td class="muted nowrap">{{ b.created_at|dt }}</td>
+    <td class="right">{% if b.status == 'running' %}<form method="post" action="/broadcast/{{ b.id }}/stop" class="inline">{{ csrf() }}<button class="btn bad xs">⏹ Стоп</button></form>{% else %}<span class="badge {{ 'ok' if b.status == 'done' else 'warn' }}">{{ {'done':'готово','stopped':'остановлена','failed':'ошибка'}.get(b.status, b.status) }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
+{% else %}<div class="card empty">Рассылок ещё не было</div>{% endif %}
+{% endblock %}
+{% block scripts %}<script>
+const ta=document.getElementById('bc_text'),btn=document.getElementById('bc_btn');
+const upd=livePreview(ta,'/preview/message','pv_bc',()=>({button:btn.value}));btn.addEventListener('input',upd);
+document.querySelectorAll('tr[data-status=running]').forEach(tr=>{
+  const tick=async()=>{try{const j=await (await fetch('/broadcast/'+tr.dataset.bc+'.json')).json();
+    tr.querySelector('.bc-text').textContent=j.sent+' из '+j.total+(j.failed?' · ошибок '+j.failed:'');
+    tr.querySelector('.bc-bar').style.width=(j.total?Math.round(100*(j.sent+j.failed)/j.total):0)+'%';
+    if(j.status!=='running')location.reload();else setTimeout(tick,2000);}catch(_){setTimeout(tick,5000)}};tick();});
+</script>{% endblock %}

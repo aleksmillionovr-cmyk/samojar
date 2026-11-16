@@ -1,0 +1,79 @@
+{% extends "base.html" %}{% from "macros.html" import status_badge, csrf %}
+{% block title %}Заказ #{{ o.id }}{% endblock %}
+{% block content %}
+<h1><a href="/orders" class="muted">← Заказы</a> / #{{ o.id }} {{ status_badge(o.status) }}</h1>
+<div class="split wide">
+  <div class="stack">
+    <div class="card">
+      <h2>{{ o.title }}</h2>
+      <dl class="kv">
+        <dt>Сумма</dt><dd><b>{{ order_paid(o) }}</b>{% if o.currency == 'XTR' %} <span class="muted">(≈ {{ o.price|money }})</span>{% endif %}</dd>
+        <dt>Способ оплаты</dt><dd>{{ METHODS.get(o.method, o.method) }}</dd>
+        <dt>Покупатель</dt><dd><a href="/users/{{ o.user_id }}">{{ o.username or o.user_id }}</a> · <code>{{ o.user_id }}</code> · <a href="tg://user?id={{ o.user_id }}">написать в Telegram</a></dd>
+        <dt>Ник Roblox</dt><dd>{% if o.nick %}<span class="nick">{{ o.nick }}</span>{% elif o.status == 'paid' %}<span class="badge warn">бот ждёт ник от покупателя</span>{% else %}—{% endif %}</dd>
+        <dt>Создан</dt><dd>{{ o.created_at|dt('%d.%m.%Y %H:%M') }}</dd>
+        <dt>Оплачен</dt><dd>{{ o.paid_at|dt('%d.%m.%Y %H:%M') }}</dd>
+        {% if o.done_at %}<dt>Выдан</dt><dd>{{ o.done_at|dt('%d.%m.%Y %H:%M') }}</dd>{% endif %}
+        {% if o.charge_id %}<dt>ID платежа</dt><dd><code>{{ o.charge_id }}</code></dd>{% endif %}
+        {% if o.ext_id %}<dt>Счёт в платёжке</dt><dd><code>{{ o.ext_id }}</code>{% if o.pay_url and o.status == 'created' %} · <a href="{{ o.pay_url }}" target="_blank" rel="noopener">ссылка на оплату</a>{% endif %}</dd>{% endif %}
+        <dt>Позиция в каталоге</dt><dd>{% if item %}<a href="/items/{{ o.kind }}/{{ o.item_key }}">{{ item.emoji }} {{ item.name }}</a>{% if not item.get('active', True) %} <span class="badge">скрыта</span>{% endif %}{% else %}<span class="muted">удалена</span>{% endif %}</dd>
+      </dl>
+      <div class="actions">
+        {% if o.status in ('paid', 'waiting') %}
+        <form method="post" action="/orders/{{ o.id }}/done" class="inline">{{ csrf() }}<button class="btn ok">✅ Выдано — уведомить покупателя</button></form>
+        {% endif %}
+        {% if o.status in ('created', 'cancelled') %}
+        <form method="post" action="/orders/{{ o.id }}/paid" class="inline" data-confirm="Отметить заказ #{{ o.id }} оплаченным? Делай это, только если деньги точно пришли (проверь в кабинете платёжки).">{{ csrf() }}<button class="btn warn">💰 Отметить оплаченным</button></form>
+        {% endif %}
+        {% if o.currency == 'XTR' and o.charge_id and o.status in ('paid','waiting','done') %}
+        <form method="post" action="/orders/{{ o.id }}/refund_stars" class="inline" data-confirm="Вернуть {{ o.amount }} ⭐ покупателю? Это нельзя отменить.">{{ csrf() }}<button class="btn bad">↩️ Вернуть звёзды</button></form>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📩 Отправить покупателю код или сообщение</h2>
+      <form method="post" action="/orders/{{ o.id }}/send">{{ csrf() }}
+        <textarea name="text" placeholder="Например: код подарочной карты или ссылка на группу" style="min-height:90px"></textarea>
+        <div class="radios">
+          <label><input type="radio" name="as" value="code" checked> как код (копируется нажатием)</label>
+          <label><input type="radio" name="as" value="text"> обычным текстом</label>
+          <label><input type="checkbox" name="close" {{ 'checked' if o.status != 'done' }}> закрыть заказ</label>
+        </div>
+        <div class="actions" style="margin-top:12px"><button class="btn">Отправить</button></div>
+      </form>
+    </div>
+
+    {% if others %}
+    <div class="card"><h2>🗂 Другие заказы этого покупателя</h2>
+      <table class="mini">{% for x in others %}<tr><td><a href="/orders/{{ x.id }}">#{{ x.id }}</a> · {{ x.title }}</td><td>{{ status_badge(x.status) }}</td><td>{{ x.price|money }}</td></tr>{% endfor %}</table>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <h2>🎮 Ник в Roblox</h2>
+      <form method="post" action="/orders/{{ o.id }}/nick">{{ csrf() }}
+        <input type="text" name="nick" value="{{ o.nick or '' }}" placeholder="Builderman">
+        <div class="actions" style="margin-top:10px"><button class="btn sec sm">Сохранить ник</button></div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>🔁 Статус вручную</h2>
+      <form method="post" action="/orders/{{ o.id }}/status">{{ csrf() }}
+        <select name="status">{% for k, v in STATUS.items() %}<option value="{{ k }}" {{ 'selected' if k == o.status }}>{{ v }}</option>{% endfor %}</select>
+        <div class="hint">Покупателю ничего не отправляется. Чтобы уведомить его, используй кнопки слева.</div>
+        <div class="actions" style="margin-top:10px"><button class="btn sec sm">Изменить статус</button></div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>📝 Заметка</h2>
+      <form method="post" action="/orders/{{ o.id }}/note">{{ csrf() }}
+        <textarea name="note" style="min-height:90px" placeholder="Видна только в админке">{{ o.note or '' }}</textarea>
+        <div class="actions" style="margin-top:10px"><button class="btn sec sm">Сохранить</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

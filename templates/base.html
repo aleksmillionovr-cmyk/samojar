@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf" content="{{ csrf_token() }}">
+<meta name="robots" content="noindex,nofollow">
+<title>{% block title %}Админка{% endblock %} · {{ shop_name }}</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💎</text></svg>">
+<link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v={{ VERSION }}">
+</head>
+<body>
+{% if session.get('ok') %}
+<div class="layout">
+  <aside class="side">
+    <div class="brand"><div class="logo">💎</div><div><b>{{ shop_name }}</b><small>панель управления</small></div></div>
+    <nav class="nav">
+      <a href="/" class="{{ 'on' if active == 'dash' }}"><span class="ico">📊</span>Сводка</a>
+      <a href="/orders" class="{{ 'on' if active == 'orders' }}"><span class="ico">🧾</span>Заказы{% if todo_count %}<span class="pill">{{ todo_count }}</span>{% endif %}</a>
+      <a href="/users" class="{{ 'on' if active == 'users' }}"><span class="ico">👥</span>Покупатели</a>
+      <a href="/broadcast" class="{{ 'on' if active == 'broadcast' }}"><span class="ico">📣</span>Рассылка</a>
+      <div class="sep">Каталог и бот</div>
+      <a href="/items/sub" class="{{ 'on' if active == 'sub' }}"><span class="ico">💎</span>Подписки</a>
+      <a href="/items/svc" class="{{ 'on' if active == 'svc' }}"><span class="ico">🛍</span>Услуги</a>
+      <a href="/texts" class="{{ 'on' if active == 'texts' }}"><span class="ico">✍️</span>Тексты</a>
+      <a href="/settings" class="{{ 'on' if active == 'settings' }}"><span class="ico">⚙️</span>Настройки{% if maintenance %}<span class="pill warn">🛠</span>{% endif %}</a>
+      <div class="sep">Сервер</div>
+      <a href="/integrations" class="{{ 'on' if active == 'integrations' }}"><span class="ico">🔌</span>Подключения</a>
+      <a href="/system" class="{{ 'on' if active == 'system' }}"><span class="ico">🛡</span>Система</a>
+    </nav>
+    <div class="side-foot">
+      <span class="ver">v{{ VERSION }}</span>
+      <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="ghost">Выйти</button></form>
+    </div>
+  </aside>
+  <div class="scrim"></div>
+  <div>
+    <div class="topbar"><button class="icon-btn" data-menu aria-label="Меню">☰</button><b>💎 {{ shop_name }}</b>{% if todo_count %}<a href="/orders" class="pill">{{ todo_count }}</a>{% endif %}</div>
+    <main>
+      {% if maintenance and active != 'settings' %}<div class="note warn" style="margin-bottom:14px">🛠 Включён <b>технический перерыв</b>: покупатели видят заглушку. <form method="post" action="/maintenance" class="inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="back" value="{{ request.path }}"><button class="btn xs ok">Выключить</button></form></div>{% endif %}
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+{% else %}
+{% block bare %}{% endblock %}
+{% endif %}
+<script src="{{ url_for('static', filename='admin.js') }}?v={{ VERSION }}"></script>
+{% block scripts %}{% endblock %}
+</body></html>
