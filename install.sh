@@ -90,6 +90,7 @@ else
   git clone -q --depth 1 -b "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 cd "$APP_DIR"
+chmod -R go-w "$APP_DIR" 2>/dev/null || true   # код меняет только root
 echo "$BRANCH" > .install-branch
 ok "Версия: $(git log -1 --format='%h %cd' --date=format:'%d.%m.%Y %H:%M' 2>/dev/null || echo '?')"
 
