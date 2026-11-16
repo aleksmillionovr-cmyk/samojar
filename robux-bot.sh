@@ -21,6 +21,10 @@ case "${1:-}" in
     systemctl restart $SERVICE && echo "✅ Перезапущен"
     ;;
   update)
+    if [ ! -d .git ]; then
+      echo "Бот установлен из архива. Для обновления распакуй новый архив и запусти: bash robux_bot/install.sh"
+      exit 1
+    fi
     BRANCH="$(cat .install-branch 2>/dev/null || echo claude/bot-deployment-admin-panel-72uvk9)"
     git fetch -q --depth 1 origin "$BRANCH"
     git reset -q --hard FETCH_HEAD

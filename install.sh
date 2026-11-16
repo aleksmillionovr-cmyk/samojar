@@ -50,9 +50,26 @@ ok "Python $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || die "Нужен Python 3.9 или новее"
 
 # ─── 2. Код бота ───
-say "Скачиваю бота (ветка $BRANCH)"
+# запуск из распакованного архива (bash robux_bot/install.sh) — берём код оттуда, без GitHub
+SELF_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bot.py" ] && [ "$SELF_DIR" != "$APP_DIR" ] && [ "${SKIP_FETCH:-0}" != 1 ]; then
+  say "Копирую бота из $SELF_DIR"
+  mkdir -p "$APP_DIR/data"
+  tar -C "$SELF_DIR" --exclude=.git --exclude=venv --exclude=data --exclude=.env --exclude=__pycache__ -cf - . \
+    | tar -C "$APP_DIR" -xf -
+  # данные старой версии (лежали рядом с кодом) — в папку data
+  for f in orders.db catalog.json catalog.backup.json .admin_secret; do
+    if [ -f "$APP_DIR/$f" ] && [ ! -f "$APP_DIR/data/$f" ]; then mv "$APP_DIR/$f" "$APP_DIR/data/$f"; fi
+  done
+  ok "Готово"
+  SKIP_FETCH=1
+fi
+[ "${SKIP_FETCH:-0}" = 1 ] || say "Скачиваю бота из GitHub (ветка $BRANCH)"
 if [ "${SKIP_FETCH:-0}" = 1 ] && [ -f "$APP_DIR/bot.py" ]; then
-  ok "Код уже обновлён"
+  :
 elif [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" fetch -q --depth 1 origin "$BRANCH"
   git -C "$APP_DIR" reset -q --hard FETCH_HEAD
