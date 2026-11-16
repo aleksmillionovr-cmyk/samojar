@@ -163,7 +163,7 @@ fix_perms() {
 
 wait_local() {  # ждём, пока админка ответит на 127.0.0.1
   for _ in $(seq 1 30); do
-    curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/healthz" && return 0
+    curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/healthz" 2>/dev/null && return 0
     sleep 2
   done
   return 1
