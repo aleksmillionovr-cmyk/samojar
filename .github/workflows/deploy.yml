@@ -1,0 +1,65 @@
+# Установка / обновление бота на сервере одной кнопкой (Actions → «Установка на сервер» → Run workflow).
+# Нужен секрет репозитория SERVER_PASSWORD (пароль root). Необязательно: секрет BOT_TOKEN.
+name: Установка на сервер
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "IP сервера"
+        default: "45.158.185.31"
+      admin_id:
+        description: "Telegram ID админа (необязательно)"
+        required: false
+        default: ""
+      admin_password_hash:
+        description: "Хэш пароля админки (необязательно)"
+        required: false
+        default: ""
+      domain:
+        description: "Свой домен вместо IP (необязательно)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Установка на сервер
+        env:
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          HOST: ${{ inputs.host }}
+          ADMIN_ID: ${{ inputs.admin_id }}
+          PW_HASH: ${{ inputs.admin_password_hash }}
+          DOMAIN: ${{ inputs.domain }}
+        run: |
+          if [ -z "$SSHPASS" ]; then echo "::error::Добавь секрет репозитория SERVER_PASSWORD (пароль root сервера)"; exit 1; fi
+          sudo apt-get install -y -qq sshpass >/dev/null
+          REMOTE="export BRANCH='$GITHUB_REF_NAME'"
+          [ -n "$BOT_TOKEN" ] && REMOTE="$REMOTE BOT_TOKEN='$BOT_TOKEN'"
+          [ -n "$ADMIN_ID" ] && REMOTE="$REMOTE ADMIN_ID='$ADMIN_ID'"
+          [ -n "$PW_HASH" ] && REMOTE="$REMOTE ADMIN_PASSWORD_HASH='$PW_HASH'"
+          [ -n "$DOMAIN" ] && REMOTE="$REMOTE DOMAIN='$DOMAIN'"
+          # пароль из .env в лог не выводим: репозиторий публичный
+          REMOTE="$REMOTE QUIET_PASSWORD=1; curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/install.sh | bash"
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "root@$HOST" "$REMOTE"
+
+      - name: Состояние сервера
+        if: always()
+        env:
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+          HOST: ${{ inputs.host }}
+        run: |
+          [ -n "$SSHPASS" ] || exit 0
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "root@$HOST" \
+            'systemctl is-active robux-bot caddy 2>&1; grep -E "^(PUBLIC_URL|ADMIN_HOST)=" /opt/robux_bot/.env; journalctl -u robux-bot -n 25 --no-pager; journalctl -u caddy -n 40 --no-pager 2>/dev/null | grep -iE "certificate|error|obtain" | tail -8' || true

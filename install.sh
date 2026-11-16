@@ -132,6 +132,19 @@ EOF
 fi
 [ -n "${BOT_TOKEN:-}" ] && set_env BOT_TOKEN "$BOT_TOKEN"
 [ -n "${ADMIN_ID:-}" ] && set_env ADMIN_ID "$ADMIN_ID"
+# пароль админки, заданный заранее хэшем (установка через GitHub Actions — чтобы пароль не попал в лог)
+if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then
+  venv/bin/python - "$ADMIN_PASSWORD_HASH" <<'PYEOF'
+import json, os, sys
+p = "data/config.json"
+c = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+c["admin_password_hash"] = sys.argv[1]
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(c, f, ensure_ascii=False, indent=2)
+PYEOF
+  QUIET_PASSWORD=1
+fi
 set_env DATA_DIR "$APP_DIR/data"
 set_env ADMIN_PORT "$PORT"
 
@@ -329,7 +342,9 @@ if wait_local; then
   printf '\033[1;32m  ✅ Готово! Магазин установлен и запущен\033[0m\n'
   printf '\033[1;32m══════════════════════════════════════════════\033[0m\n\n'
   echo "  🖥  Админка:  $PUBLIC_URL"
-  if [ -n "$NEW_PASS" ]; then
+  if [ "${QUIET_PASSWORD:-0}" = 1 ]; then
+    echo "  🔑 Пароль:   задан при установке (в лог не выводится)"
+  elif [ -n "$NEW_PASS" ]; then
     echo "  🔑 Пароль:   $NEW_PASS"
     echo "     (сохрани его! сменить можно в админке → «Система»)"
   else
