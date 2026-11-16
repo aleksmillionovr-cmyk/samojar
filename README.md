@@ -28,6 +28,11 @@ curl -fsSL https://raw.githubusercontent.com/aleksmillionovr-cmyk/samojar/claude
 
 Свой домен вместо IP: `curl … | DOMAIN=shop.example.ru bash` (A-запись домена должна смотреть на сервер).
 
+### Установка и обновление через GitHub (без SSH)
+
+В репозитории есть кнопка установки: **Actions → «Установка на сервер» → Run workflow**.
+Нужен секрет репозитория `SERVER_PASSWORD` (пароль root сервера), необязательно — `BOT_TOKEN`.
+
 ### Команды на сервере
 
 | Команда | Что делает |
